@@ -34,9 +34,18 @@ Still read it case-insensitively to be safe.
 
 ### table `ledger`
 id (bigint PK, identity), ts (timestamptz default now()), sku_code (text), packmat (text:
-'carton'|'cld'|'sac'|'laminate'|'divider'), direction (text: 'issue'|'return'|'receive'|
-'adjust'|'block'), qty_base (numeric), line (text, machine/line for issues), shift (text
-'A'|'B'|'C'), note (text).
+'carton'|'cld'|'sac'|'laminate'|'divider'), direction (text, see below), qty_base (numeric),
+line (text, machine/line for issues), shift (text 'A'|'B'|'C'), note (text).
+`direction` is FREE TEXT — new values need no SQL. Effect on the computed figures:
+| direction | on-hand      | blocked |
+|-----------|--------------|---------|
+| receive   | + qty        | -       |
+| return    | + qty        | -       |
+| issue     | - qty        | -       |
+| block     | - qty        | + qty   |
+| unblock   | + qty        | - qty   |  (QA released it back to usable stock)
+| scrap     | no change    | - qty   |  (already left on-hand at block; written off for good)
+| adjust    | = qty (absolute) | -   |  (Sunday stock count force-set)
 
 ### table `conversion`   <-- IMPORTANT: this now holds the real per-tonne factors
 weight (int PK, grams), cartons_per_t (numeric), pouch_per_t (numeric), lam_per_t (numeric),
@@ -72,6 +81,9 @@ demand_t, need_base, onhand_base, status ('open'|'sent'|'received'|'cancelled'),
 - **D** unit dropdown per packmat (see 3b). DONE.
 - **E** phasing upload -> preview -> OK -> shortfall, shift A/B/C priority. DONE.
 - **F** conversion CSV upsert in Settings (`upsertConversion`). DONE.
+- **H** Sunday stock count (bulk `adjust` sheet), blocked-material Release/Scrap,
+  shortfall results as a popup, inventory sorted stock-first, Kasani "Received" opens the
+  Incoming form prefilled and books the ledger row + closes the ask together. DONE.
 - **G** Kasani requests: shortfall rows -> `kasani_requests`, manual ad-hoc ask,
   open-request list with Sent/Received/Cancel. DONE.
 

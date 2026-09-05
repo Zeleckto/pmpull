@@ -47,6 +47,14 @@ export async function addLedger(entry) {
   if (error) console.error("addLedger", error);
   return { error };
 }
+// bulk insert (used by the Sunday stock count, which writes one `adjust` row per counted line)
+export async function addLedgerMany(rows) {
+  if (!hasSupabase) return { error: "no db" };
+  if (!rows.length) return { error: null };
+  const { error } = await supabase.from("ledger").insert(rows);
+  if (error) console.error("addLedgerMany", error);
+  return { error };
+}
 export async function loadLedger() {
   if (!hasSupabase) return [];
   const { data, error } = await supabase.from("ledger").select("*").order("ts", { ascending: false });
@@ -54,21 +62,29 @@ export async function loadLedger() {
   return data || [];
 }
 
-// available on-hand: receive+return-issue-block ; adjust sets absolute
+// available on-hand: receive + return + unblock - issue - block ; adjust sets absolute.
+// `scrap` does NOT move on-hand: the material left on-hand when it was blocked, scrapping
+// only confirms it is never coming back (it clears out of the blocked figure instead).
 export function computeOnHand(ledgerRows) {
   const m = {};
   for (const r of ledgerRows) {
     const k = `${r.sku_code}|${r.packmat}`; const q = Number(r.qty_base) || 0;
-    if (r.direction === "issue" || r.direction === "block") m[k] = (m[k] || 0) - q;
-    else if (r.direction === "adjust") m[k] = q;
-    else m[k] = (m[k] || 0) + q; // receive / return
+    const d = r.direction;
+    if (d === "issue" || d === "block") m[k] = (m[k] || 0) - q;
+    else if (d === "adjust") m[k] = q;              // stock count: absolute value
+    else if (d === "scrap") m[k] = m[k] || 0;       // already out of on-hand
+    else m[k] = (m[k] || 0) + q;                    // receive / return / unblock
   }
   return m;
 }
-// total currently blocked (for display)
+// how much is still sitting blocked awaiting a decision (block - released - scrapped)
 export function computeBlocked(ledgerRows) {
   const m = {};
-  for (const r of ledgerRows) { if (r.direction === "block") { const k = `${r.sku_code}|${r.packmat}`; m[k] = (m[k] || 0) + (Number(r.qty_base) || 0); } }
+  for (const r of ledgerRows) {
+    const k = `${r.sku_code}|${r.packmat}`; const q = Number(r.qty_base) || 0;
+    if (r.direction === "block") m[k] = (m[k] || 0) + q;
+    else if (r.direction === "unblock" || r.direction === "scrap") m[k] = (m[k] || 0) - q;
+  }
   return m;
 }
 

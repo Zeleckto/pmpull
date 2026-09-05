@@ -3,7 +3,7 @@ import * as XLSX from "xlsx";
 import { hasSupabase } from "./supabase";
 import {
   loadSkus, upsertSkus, updateSku, deleteAllSkus, loadConversion, upsertConversion,
-  addLedger, loadLedger, computeOnHand, computeBlocked,
+  addLedger, addLedgerMany, loadLedger, computeOnHand, computeBlocked,
   loadRequests, closeRequest,
   loadKasaniRequests, addKasaniRequests, setKasaniStatus,
 } from "./data";
@@ -130,14 +130,23 @@ export default function App() {
       {tab === "requests" && <PMRequests requests={requests}
         onFulfill={async (r) => { await addLedger({ sku_code: r.sku_code, packmat: r.packmat, direction: "issue", qty_base: r.qty_base, line: r.line, shift: r.shift, note: "fulfil request" }); await closeRequest(r.id); refresh(); }} />}
 
-      {tab === "inventory" && <Inventory skus={skus} conv={conv} onHand={onHand} blocked={blocked} openModal={(t, sku, pm) => setModal({ type: t, sku, packmat: pm })} />}
+      {tab === "inventory" && <Inventory skus={skus} conv={conv} onHand={onHand} blocked={blocked} openModal={setModal} />}
 
-      {tab === "shortfall" && <Shortfall skus={skus} conv={conv} onHand={onHand} kasani={kasani} refresh={refresh} />}
+      {tab === "shortfall" && <Shortfall skus={skus} conv={conv} onHand={onHand} kasani={kasani} refresh={refresh} openModal={setModal} />}
 
       {tab === "settings" && <Settings skus={skus} msg={msg} setMsg={setMsg} refresh={refresh} />}
 
-      {modal && <ActionModal modal={modal} skus={skus} onHand={onHand} onClose={() => setModal(null)}
+      {modal && modal.type === "count" && <CountSheet skus={skus} onHand={onHand} onClose={() => setModal(null)} onSaved={() => { setModal(null); refresh(); }} />}
+
+      {modal && modal.type === "blocked" && <BlockedFix modal={modal} onClose={() => setModal(null)}
         onSave={async (e) => { await addLedger(e); setModal(null); refresh(); }} />}
+
+      {modal && !["count", "blocked"].includes(modal.type) && <ActionModal modal={modal} skus={skus} onHand={onHand} onClose={() => setModal(null)}
+        onSave={async (e) => {
+          await addLedger(e);
+          if (modal.kasaniId) await setKasaniStatus(modal.kasaniId, "received");  // receive + close the ask together
+          setModal(null); refresh();
+        }} />}
     </div>
   );
 }
@@ -164,21 +173,30 @@ function Inventory({ skus, conv, onHand, blocked, openModal }) {
     const qty = onHand[`${s.code}|${pm}`] || 0;
     rows.push({ code: s.code, desc: s.description, pm, code_pm: codeFor(s, pm), qty, fg: fgEquiv(pm, qty, s, conv), blk: blocked[`${s.code}|${pm}`] || 0 });
   }));
-  const f = rows.filter((r) => !q || `${r.code} ${r.desc} ${LBL[r.pm]} ${r.code_pm}`.toLowerCase().includes(q.toLowerCase()));
+  // what we actually have comes first, most stock first; empty/negative rows fall to the bottom
+  const f = rows
+    .filter((r) => !q || `${r.code} ${r.desc} ${LBL[r.pm]} ${r.code_pm}`.toLowerCase().includes(q.toLowerCase()))
+    .sort((a, b) => {
+      if ((a.qty > 0) !== (b.qty > 0)) return a.qty > 0 ? -1 : 1;
+      if (a.qty > 0 && a.qty !== b.qty) return b.qty - a.qty;
+      return a.code.localeCompare(b.code) || a.pm.localeCompare(b.pm);
+    });
+  const inStock = f.filter((r) => r.qty > 0).length;
   return (<div>
     <div style={card}>
       <b>Store actions</b>
       <div style={{ display: "flex", gap: 8, flexWrap: "wrap", marginTop: 8 }}>
-        <button onClick={() => openModal("issue")} style={btn(C.slate)}>Issue packmat</button>
-        <button onClick={() => openModal("receive")} style={btn(C.green)}>Incoming from Kasani</button>
-        <button onClick={() => openModal("return")} style={btn(C.amber)}>Return unused</button>
-        <button onClick={() => openModal("block")} style={btn(C.red)}>Block / reject</button>
+        <button onClick={() => openModal({ type: "issue" })} style={btn(C.slate)}>Issue packmat</button>
+        <button onClick={() => openModal({ type: "receive" })} style={btn(C.green)}>Incoming from Kasani</button>
+        <button onClick={() => openModal({ type: "return" })} style={btn(C.amber)}>Return unused</button>
+        <button onClick={() => openModal({ type: "block" })} style={btn(C.red)}>Block / reject</button>
+        <button onClick={() => openModal({ type: "count" })} style={btn("#6d28d9")}>Sunday stock count</button>
       </div>
-      <div style={{ fontSize: 12, color: C.muted, marginTop: 6 }}>Each opens a form and writes a timestamped ledger entry. Issue records the machine line.</div>
+      <div style={{ fontSize: 12, color: C.muted, marginTop: 6 }}>Each opens a form and writes a timestamped ledger entry. Issue records the machine line. Stock count force-sets on-hand to what you physically counted.</div>
     </div>
     <div style={card}>
       <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 8 }}>
-        <b>Inventory ({f.length} rows)</b>
+        <b>Inventory — {inStock} in stock, {f.length - inStock} empty</b>
         <input placeholder="search SKU / desc / packmat / code" value={q} onChange={(e) => setQ(e.target.value)} style={{ ...inp, width: 300 }} />
       </div>
       <div style={{ maxHeight: 440, overflowY: "auto" }}>
@@ -192,7 +210,12 @@ function Inventory({ skus, conv, onHand, blocked, openModal }) {
               <td style={{ ...td, fontFamily: "monospace", fontSize: 12, color: C.muted }}>{r.code_pm || "—"}</td>
               <td style={{ ...td, fontWeight: 600, color: r.qty <= 0 ? C.red : C.ink }}>{Math.round(r.qty)} {UNIT[r.pm]}</td>
               <td style={td}>{r.fg.toFixed(2)}</td>
-              <td style={{ ...td, color: r.blk ? C.red : C.muted }}>{r.blk ? Math.round(r.blk) : "—"}</td>
+              <td style={{ ...td, color: r.blk > 0 ? C.red : C.muted }}>
+                {r.blk > 0
+                  ? <button onClick={() => openModal({ type: "blocked", sku: r.code, packmat: r.pm, qty: Math.round(r.blk) })}
+                      style={{ ...ghost, color: C.red, padding: "3px 8px", fontSize: 13 }}>{Math.round(r.blk)} — resolve</button>
+                  : "—"}
+              </td>
             </tr>))}</tbody>
         </table>
       </div>
@@ -200,14 +223,122 @@ function Inventory({ skus, conv, onHand, blocked, openModal }) {
   </div>);
 }
 
+// ---------------- Sunday stock count (force-set on-hand) ----------------
+// Writes one `adjust` ledger row per line you actually changed. `adjust` sets on-hand to an
+// absolute value, so the counted figure wins over whatever the ledger had accumulated.
+function CountSheet({ skus, onHand, onClose, onSaved }) {
+  const [q, setQ] = useState("");
+  const [counted, setCounted] = useState({});     // "code|pm" -> typed string
+  const [note, setNote] = useState("Sunday stock count");
+  const [busy, setBusy] = useState(false);
+  const [err, setErr] = useState("");
+
+  const rows = [];
+  skus.forEach((s) => compsOf(s).forEach((pm) => {
+    const key = `${s.code}|${pm}`;
+    rows.push({ key, code: s.code, desc: s.description, pm, now: Math.round(onHand[key] || 0) });
+  }));
+  const f = rows
+    .filter((r) => !q || `${r.code} ${r.desc} ${LBL[r.pm]}`.toLowerCase().includes(q.toLowerCase()))
+    .sort((a, b) => (b.now > 0) - (a.now > 0) || a.code.localeCompare(b.code) || a.pm.localeCompare(b.pm));
+
+  // only lines with a number typed that actually differs from the computed on-hand
+  const changes = rows.filter((r) => {
+    const v = counted[r.key];
+    return v !== undefined && v !== "" && Number(v) !== r.now && Number.isFinite(Number(v));
+  });
+
+  const save = async () => {
+    if (!changes.length) return;
+    setBusy(true);
+    const { error } = await addLedgerMany(changes.map((r) => ({
+      sku_code: r.code, packmat: r.pm, direction: "adjust",
+      qty_base: Number(counted[r.key]), line: "", shift: "",
+      note: `${note} (was ${r.now})`,
+    })));
+    setBusy(false);
+    if (error) { setErr(error.message || String(error)); return; }
+    onSaved();
+  };
+
+  return (<Overlay wide onClose={onClose}>
+    <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", gap: 12, flexWrap: "wrap" }}>
+      <b>Sunday stock count</b>
+      <input placeholder="search SKU / packmat" value={q} onChange={(e) => setQ(e.target.value)} style={{ ...inp, width: 240 }} />
+    </div>
+    <div style={{ fontSize: 12, color: C.muted, margin: "6px 0 10px" }}>
+      Type the counted quantity only on the lines you actually counted — blanks are left alone.
+      Saving force-sets on-hand for those lines and writes an <b>adjust</b> row to the ledger, so the correction is auditable.
+    </div>
+    <div style={{ maxHeight: "50vh", overflowY: "auto" }}>
+      <table style={{ width: "100%", borderCollapse: "collapse" }}>
+        <thead><tr><th style={th}>SKU</th><th style={th}>Description</th><th style={th}>Packmat</th><th style={th}>System</th><th style={th}>Counted</th><th style={th}>Diff</th></tr></thead>
+        <tbody>{f.map((r) => {
+          const v = counted[r.key];
+          const has = v !== undefined && v !== "" && Number.isFinite(Number(v));
+          const d = has ? Number(v) - r.now : 0;
+          return (<tr key={r.key}>
+            <td style={{ ...td, fontWeight: 600 }}>{r.code}</td>
+            <td style={{ ...td, color: C.muted, fontSize: 13 }}>{(r.desc || "").slice(0, 24)}</td>
+            <td style={td}>{LBL[r.pm]}</td>
+            <td style={td}>{r.now} {UNIT[r.pm]}</td>
+            <td style={td}><input type="number" value={v ?? ""} placeholder="—"
+              onChange={(e) => setCounted({ ...counted, [r.key]: e.target.value })}
+              style={{ ...inp, width: 100, borderColor: has && d !== 0 ? C.amber : C.line }} /></td>
+            <td style={{ ...td, fontWeight: 600, color: !has || d === 0 ? C.muted : d > 0 ? C.green : C.red }}>
+              {!has || d === 0 ? "—" : (d > 0 ? `+${d}` : d)}
+            </td>
+          </tr>);
+        })}</tbody>
+      </table>
+    </div>
+    <input placeholder="note on the ledger rows" value={note} onChange={(e) => setNote(e.target.value)} style={{ ...inp, width: "100%", marginTop: 10 }} />
+    {err && <div style={{ color: C.red, fontSize: 12, marginTop: 8 }}>{err}</div>}
+    <div style={{ display: "flex", gap: 8, marginTop: 12 }}>
+      <button onClick={onClose} style={{ ...ghost, flex: 1 }}>Cancel</button>
+      <button onClick={save} disabled={busy || !changes.length}
+        style={{ ...btn(changes.length ? "#6d28d9" : "#94a3b8"), flex: 2, cursor: changes.length ? "pointer" : "not-allowed" }}>
+        {busy ? "Saving…" : `Save ${changes.length} correction(s)`}
+      </button>
+    </div>
+  </Overlay>);
+}
+
+// ---------------- Resolve blocked / rejected material ----------------
+// Release  -> back into usable on-hand, and out of the blocked figure.
+// Scrap    -> stays out of on-hand (it left when it was blocked), just clears the blocked figure.
+function BlockedFix({ modal, onClose, onSave }) {
+  const [qty, setQty] = useState(String(modal.qty || ""));
+  const max = Number(modal.qty) || 0;
+  const q = Number(qty) || 0;
+  const go = (direction) => {
+    if (!q || q > max) return;
+    onSave({ sku_code: modal.sku, packmat: modal.packmat, direction, qty_base: q, line: "", shift: "", note: direction === "unblock" ? "released from block" : "scrapped from block" });
+  };
+  return (<Overlay onClose={onClose}>
+    <b>Blocked material — {modal.sku} · {LBL[modal.packmat]}</b>
+    <div style={{ fontSize: 12, color: C.muted, margin: "6px 0 10px" }}>
+      {max} {UNIT[modal.packmat]} currently blocked. Release puts it back into usable stock; scrap writes it off for good. Either way it leaves the blocked column.
+    </div>
+    <label style={{ fontSize: 12 }}>Quantity to resolve</label><br />
+    <input type="number" value={qty} onChange={(e) => setQty(e.target.value)} style={{ ...inp, width: "100%" }} />
+    {q > max && <div style={{ color: C.red, fontSize: 12, marginTop: 6 }}>Only {max} is blocked.</div>}
+    <div style={{ display: "flex", gap: 8, marginTop: 14 }}>
+      <button onClick={() => go("unblock")} disabled={!q || q > max} style={{ ...btn(C.green), flex: 1 }}>Release to stock</button>
+      <button onClick={() => go("scrap")} disabled={!q || q > max} style={{ ...btn(C.red), flex: 1 }}>Scrap / write off</button>
+    </div>
+  </Overlay>);
+}
+
 // ---------------- Shortfall from Kasani ----------------
 // Flow: upload phasing CSV -> PREVIEW -> OK -> shortfall computed, shift A first (priority 1),
 // then B, then C. On-hand is consumed in that order, so a later shift never counts stock that
 // an earlier, more urgent shift has already been allocated.
-function Shortfall({ skus, conv, onHand, kasani, refresh }) {
+function Shortfall({ skus, conv, onHand, kasani, refresh, openModal }) {
   const [planDate, setPlanDate] = useState(today());
   const [preview, setPreview] = useState(null);   // rows read from the file, before OK
   const [plan, setPlan] = useState(null);         // computed shortfall rows
+  const [showPlan, setShowPlan] = useState(false);// results open as a popup
   const [sel, setSel] = useState({});             // row index -> selected
   const [note, setNote] = useState("");
   const [busy, setBusy] = useState(false);
@@ -273,7 +404,7 @@ function Shortfall({ skus, conv, onHand, kasani, refresh }) {
     out.sort((a, b) => a.priority - b.priority || b.short - a.short || a.code.localeCompare(b.code));
     const s0 = {};
     out.forEach((r, i) => { if (r.short > 0) s0[i] = true; });
-    setPlan(out); setSel(s0);
+    setPlan(out); setSel(s0); setShowPlan(out.length > 0);
     setInfo(out.length ? "" : "Nothing to compute — none of those SKU codes matched the SKU master.");
   };
 
@@ -292,44 +423,61 @@ function Shortfall({ skus, conv, onHand, kasani, refresh }) {
     const { error } = await addKasaniRequests(rows);
     setBusy(false);
     setInfo(error ? `Error: ${error.message || error}` : `Sent ${rows.length} request(s) to Kasani.`);
-    if (!error) { setSel({}); await refresh(); }
+    if (!error) { setSel({}); setShowPlan(false); await refresh(); }
   };
 
   const nShort = (plan || []).filter((r) => r.short > 0).length;
+  const byPrio = (p) => (plan || []).filter((r) => r.priority === p && r.short > 0).length;
 
   return (<div>
-    {/* results render at the top */}
-    {plan && <div style={card}>
-      <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 8, gap: 12, flexWrap: "wrap" }}>
-        <b>Shortfall for {planDate} — {nShort} short of {plan.length} line(s)</b>
-        <div style={{ display: "flex", gap: 8, alignItems: "center" }}>
-          <input placeholder="note for Kasani (optional)" value={note} onChange={(e) => setNote(e.target.value)} style={{ ...inp, width: 210 }} />
-          <button onClick={ask} disabled={busy || !chosen.length} style={{ ...btn(chosen.length ? C.red : "#94a3b8"), cursor: chosen.length ? "pointer" : "not-allowed" }}>
-            {busy ? "Sending…" : `Ask Kasani (${chosen.length})`}
-          </button>
-        </div>
+    {/* results open as a popup so they can't be missed further down the page */}
+    {plan && showPlan && <Overlay wide onClose={() => setShowPlan(false)}>
+      <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", gap: 12, flexWrap: "wrap" }}>
+        <b style={{ fontSize: 16 }}>Shortfall for {planDate}</b>
+        <button onClick={() => setShowPlan(false)} style={ghost}>Close</button>
+      </div>
+      <div style={{ display: "flex", gap: 8, flexWrap: "wrap", margin: "10px 0" }}>
+        <Stat label="Lines checked" value={plan.length} />
+        <Stat label="Short" value={nShort} color={nShort ? C.red : C.green} />
+        <Stat label="Covered" value={plan.length - nShort} color={C.green} />
+        <Stat label="Prio 1 · A" value={byPrio(1)} color={prioColor(1)} />
+        <Stat label="Prio 2 · B" value={byPrio(2)} color={prioColor(2)} />
+        <Stat label="Prio 3 · C" value={byPrio(3)} color={prioColor(3)} />
       </div>
       <div style={{ fontSize: 12, color: C.muted, marginBottom: 8 }}>
-        Stock is allocated shift A first, then B, then C — so &quot;on-hand&quot; below is what is still free for that shift.
+        Stock is allocated shift A first, then B, then C — so <b>On-hand</b> is what is still free for that shift, and <b>Short</b> is what Kasani has to send. Untick anything you do not want to ask for.
       </div>
-      <div style={{ maxHeight: 420, overflowY: "auto" }}>
+      <div style={{ maxHeight: "46vh", overflowY: "auto" }}>
         <table style={{ width: "100%", borderCollapse: "collapse" }}>
           <thead><tr>
             <th style={th}></th><th style={th}>Priority</th><th style={th}>SKU</th><th style={th}>Packmat</th>
             <th style={th}>Demand (t)</th><th style={th}>Needed</th><th style={th}>On-hand</th><th style={th}>Short &#8594; pull</th>
           </tr></thead>
-          <tbody>{plan.map((r, i) => (<tr key={i}>
+          <tbody>{plan.map((r, i) => (<tr key={i} style={{ background: r.short > 0 ? "#fff" : "#fafafa" }}>
             <td style={td}>{r.short > 0 ? <input type="checkbox" checked={!!sel[i]} onChange={(e) => setSel({ ...sel, [i]: e.target.checked })} /> : null}</td>
             <td style={td}><span style={pill(prioColor(r.priority))}>{r.priority} &middot; {r.shift}</span></td>
             <td style={{ ...td, fontWeight: 600 }}>{r.code}</td>
             <td style={td}>{LBL[r.pm]}</td>
             <td style={td}>{r.t.toFixed(2)}</td>
-            <td style={td}>{r.need}</td>
-            <td style={td}>{r.have}</td>
+            <td style={td}>{r.need} {UNIT[r.pm]}</td>
+            <td style={td}>{r.have} {UNIT[r.pm]}</td>
             <td style={{ ...td, fontWeight: 600, color: r.short > 0 ? C.red : C.green }}>{r.short > 0 ? `${r.short} ${UNIT[r.pm]}` : "covered"}</td>
           </tr>))}</tbody>
         </table>
       </div>
+      <div style={{ display: "flex", gap: 8, marginTop: 12, alignItems: "center", flexWrap: "wrap" }}>
+        <input placeholder="note for Kasani (optional)" value={note} onChange={(e) => setNote(e.target.value)} style={{ ...inp, flex: 1, minWidth: 180 }} />
+        <button onClick={ask} disabled={busy || !chosen.length}
+          style={{ ...btn(chosen.length ? C.red : "#94a3b8"), cursor: chosen.length ? "pointer" : "not-allowed" }}>
+          {busy ? "Sending…" : `Ask Kasani for ${chosen.length} item(s)`}
+        </button>
+      </div>
+    </Overlay>}
+
+    {/* one-line reminder once the popup is closed */}
+    {plan && !showPlan && <div style={{ ...card, display: "flex", justifyContent: "space-between", alignItems: "center", gap: 12, flexWrap: "wrap", borderLeft: `4px solid ${nShort ? C.red : C.green}` }}>
+      <b>Shortfall for {planDate}: {nShort} of {plan.length} line(s) short</b>
+      <button onClick={() => setShowPlan(true)} style={btn(C.slate)}>View / Ask Kasani</button>
     </div>}
 
     {/* upload -> preview -> OK */}
@@ -369,7 +517,14 @@ function Shortfall({ skus, conv, onHand, kasani, refresh }) {
     </div>
 
     <ManualKasaniAsk skus={skus} onHand={onHand} planDate={planDate} refresh={refresh} />
-    <KasaniOpenList kasani={kasani} refresh={refresh} />
+    <KasaniOpenList kasani={kasani} refresh={refresh} openModal={openModal} />
+  </div>);
+}
+
+function Stat({ label, value, color }) {
+  return (<div style={{ border: `1px solid ${C.line}`, borderRadius: 8, padding: "6px 12px", minWidth: 78 }}>
+    <div style={{ fontSize: 11, color: C.muted }}>{label}</div>
+    <div style={{ fontSize: 18, fontWeight: 700, color: color || C.ink }}>{value}</div>
   </div>);
 }
 
@@ -435,11 +590,14 @@ function ManualKasaniAsk({ skus, onHand, planDate, refresh }) {
 }
 
 // ---- open asks sitting with Kasani ----
-function KasaniOpenList({ kasani, refresh }) {
+function KasaniOpenList({ kasani, refresh, openModal }) {
   const set = async (id, status) => { await setKasaniStatus(id, status); await refresh(); };
+  // Received opens the Incoming form prefilled — correct the qty to what actually turned up,
+  // then Save writes the ledger row AND closes the request in one go.
+  const receive = (k) => openModal({ type: "receive", sku: k.sku_code, packmat: k.packmat, qty: Math.round(k.qty_base), kasaniId: k.id });
   return (<div style={card}>
     <b>Requests with Kasani ({kasani.length})</b>
-    <div style={{ fontSize: 12, color: C.muted, margin: "4px 0 10px" }}>Worked in priority order: 1 = shift A (now), 2 = B, 3 = C. Mark <i>Received</i> once the material lands, then record it as <i>Incoming from Kasani</i> in Inventory so the ledger picks it up.</div>
+    <div style={{ fontSize: 12, color: C.muted, margin: "4px 0 10px" }}>Worked in priority order: 1 = shift A (now), 2 = B, 3 = C. <b>Received</b> opens the Incoming form prefilled — adjust the quantity to what actually arrived, and saving books it into the ledger and closes the request together.</div>
     {kasani.length === 0 ? <div style={{ color: C.muted, fontSize: 14, padding: 8 }}>Nothing pending with Kasani.</div> :
       <div style={{ maxHeight: 340, overflowY: "auto" }}>
         <table style={{ width: "100%", borderCollapse: "collapse" }}>
@@ -453,7 +611,7 @@ function KasaniOpenList({ kasani, refresh }) {
             <td style={{ ...td, fontWeight: 600, color: k.status === "sent" ? C.amber : C.red }}>{k.status}</td>
             <td style={{ ...td, whiteSpace: "nowrap" }}>
               {k.status === "open" && <button onClick={() => set(k.id, "sent")} style={{ ...ghost, padding: "5px 9px", marginRight: 6 }}>Sent</button>}
-              <button onClick={() => set(k.id, "received")} style={{ ...btn(C.green), padding: "5px 9px", marginRight: 6 }}>Received</button>
+              <button onClick={() => receive(k)} style={{ ...btn(C.green), padding: "5px 9px", marginRight: 6 }}>Received</button>
               <button onClick={() => set(k.id, "cancelled")} style={{ ...ghost, padding: "5px 9px", color: C.red }}>Cancel</button>
             </td>
           </tr>))}</tbody>
@@ -600,7 +758,8 @@ function ActionModal({ modal, skus, onHand, onClose, onSave }) {
   const s = skus.find((x) => x.code === sku);
   const comps = s ? compsOf(s) : [];
   const [packmat, setPackmat] = useState(modal.packmat || "");
-  const [qty, setQty] = useState(""); const [unit, setUnit] = useState("pcs");
+  const [qty, setQty] = useState(modal.qty ? String(modal.qty) : "");   // prefilled when it came from a Kasani ask
+  const [unit, setUnit] = useState(baseUnit(modal.packmat || "carton"));
   const [line, setLine] = useState(""); const [shift, setShift] = useState("A");
   useEffect(() => { if (s && !comps.includes(packmat)) setPackmat(comps[0] || ""); }, [sku]); // eslint-disable-line
   useEffect(() => { setUnit(baseUnit(packmat || "carton")); }, [packmat]);
@@ -618,6 +777,9 @@ function ActionModal({ modal, skus, onHand, onClose, onSave }) {
     });
   };
   return (<Overlay onClose={onClose}><b>{titles[modal.type]}</b>
+    {modal.kasaniId && <div style={{ fontSize: 12, color: C.green, marginTop: 6, background: "#f0fdf4", border: "1px solid #bbf7d0", borderRadius: 6, padding: "6px 8px" }}>
+      Against Kasani request #{modal.kasaniId} ({modal.qty} {UNIT[modal.packmat]} asked). Change the quantity if less arrived — saving books it to the ledger and marks the request received.
+    </div>}
     <label style={{ fontSize: 12, display: "block", margin: "10px 0 4px" }}>SKU <span style={{ color: C.muted }}>(in-stock first)</span></label>
     <select value={sku} onChange={(e) => setSku(e.target.value)} style={{ ...inp, width: "100%" }}><option value="">select…</option>{ordered.map((x) => <option key={x.code} value={x.code}>{x.code} — {(x.description || "").slice(0, 26)}</option>)}</select>
     <div style={{ display: "flex", gap: 8, marginTop: 8, flexWrap: "wrap" }}>
@@ -635,8 +797,8 @@ function ActionModal({ modal, skus, onHand, onClose, onSave }) {
   </Overlay>);
 }
 
-function Overlay({ children, onClose }) {
+function Overlay({ children, onClose, wide }) {
   return (<div onClick={onClose} style={{ position: "fixed", inset: 0, background: "rgba(15,23,42,0.5)", display: "flex", alignItems: "center", justifyContent: "center", padding: 16, zIndex: 50 }}>
-    <div onClick={(e) => e.stopPropagation()} style={{ background: "#fff", borderRadius: 12, padding: 18, width: "100%", maxWidth: 440, maxHeight: "88vh", overflowY: "auto" }}>{children}</div>
+    <div onClick={(e) => e.stopPropagation()} style={{ background: "#fff", borderRadius: 12, padding: 18, width: "100%", maxWidth: wide ? 920 : 440, maxHeight: "88vh", overflowY: "auto" }}>{children}</div>
   </div>);
 }
