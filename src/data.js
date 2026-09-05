@@ -89,3 +89,34 @@ export async function closeRequest(id) {
   const { error } = await supabase.from("requests").update({ status: "done" }).eq("id", id);
   if (error) console.error("closeRequest", error);
 }
+
+// ---------- Conversion upload (Settings) ----------
+export async function upsertConversion(rows) {
+  if (!hasSupabase) return { error: "no db" };
+  const { error } = await supabase.from("conversion").upsert(rows, { onConflict: "weight" });
+  if (error) console.error("upsertConversion", error);
+  return { error };
+}
+
+// ---------- Kasani requests (what the PM store asks Kasani to dispatch) ----------
+// Priority 1 = shift A (needed now), 2 = B, 3 = C. Kasani works the open list in that order.
+export async function loadKasaniRequests() {
+  if (!hasSupabase) return [];
+  const { data, error } = await supabase.from("kasani_requests").select("*")
+    .neq("status", "cancelled").neq("status", "received")
+    .order("priority", { ascending: true }).order("ts", { ascending: true });
+  if (error) { console.error("loadKasaniRequests", error); return []; }
+  return data || [];
+}
+export async function addKasaniRequests(rows) {
+  if (!hasSupabase) return { error: "no db" };
+  const { error } = await supabase.from("kasani_requests").insert(rows);
+  if (error) console.error("addKasaniRequests", error);
+  return { error };
+}
+export async function setKasaniStatus(id, status) {
+  if (!hasSupabase) return { error: "no db" };
+  const { error } = await supabase.from("kasani_requests").update({ status }).eq("id", id);
+  if (error) console.error("setKasaniStatus", error);
+  return { error };
+}
