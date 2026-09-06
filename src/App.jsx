@@ -415,6 +415,7 @@ function Shortfall({ skus, conv, onHand, kasani, refresh, openModal }) {
     setBusy(true);
     const rows = chosen.map((r) => ({
       plan_date: planDate, sku_code: r.code, packmat: r.pm,
+      sku_desc: r.desc || "", packmat_code: codeFor(skus.find((x) => x.code === r.code) || {}, r.pm) || "",
       qty_base: r.short, unit: baseUnit(r.pm), qty_entered: r.short,
       shift: r.shift, priority: r.priority, source: "phasing",
       demand_t: r.t, need_base: r.need, onhand_base: r.have,
@@ -550,7 +551,9 @@ function ManualKasaniAsk({ skus, onHand, planDate, refresh }) {
   const save = async () => {
     if (!sku || !packmat || !qb) { setInfo("Pick a SKU, packmat and quantity."); return; }
     const { error } = await addKasaniRequests([{
-      plan_date: planDate, sku_code: sku, packmat, qty_base: qb, unit,
+      plan_date: planDate, sku_code: sku, packmat,
+      sku_desc: (s && s.description) || "", packmat_code: (s && codeFor(s, packmat)) || "",
+      qty_base: qb, unit,
       qty_entered: Number(qty), shift, priority: PRIO[shift] || 9, source: "manual",
       onhand_base: onHand[`${sku}|${packmat}`] || 0, status: "open", note,
     }]);
