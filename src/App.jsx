@@ -1,7 +1,7 @@
 import React, { useEffect, useMemo, useState } from "react";
 import * as XLSX from "xlsx";
 import { hasSupabase } from "./supabase";
-import { upsertLineMaterials, clearLineMaterials } from "./dataKasani";
+import { upsertLineMaterials, clearLineMaterials, loadLinesMap, loadPackConfig } from "./dataKasani";
 import {
   loadSkus, upsertSkus, updateSku, deleteAllSkus, loadConversion, upsertConversion,
   addLedger, addLedgerMany, loadLedger, computeOnHand, computeBlocked,
@@ -93,6 +93,8 @@ export default function App() {
   const [ledger, setLedger] = useState([]);
   const [requests, setRequests] = useState([]);
   const [kasani, setKasani] = useState([]);
+  const [lines, setLines] = useState([]);
+  const [cfg, setCfg] = useState([]);
   const [modal, setModal] = useState(null); // {type, sku?, packmat?}
   const [msg, setMsg] = useState("");
   const onHand = computeOnHand(ledger);
@@ -104,6 +106,8 @@ export default function App() {
     setLedger(await loadLedger());
     setRequests(await loadRequests());
     setKasani(await loadKasaniRequests());
+    setLines(await loadLinesMap());
+    setCfg(await loadPackConfig());
   };
   useEffect(() => { refresh(); }, []);
 
@@ -137,12 +141,12 @@ export default function App() {
 
       {tab === "settings" && <Settings skus={skus} msg={msg} setMsg={setMsg} refresh={refresh} />}
 
-      {modal && modal.type === "count" && <CountSheet skus={skus} onHand={onHand} onClose={() => setModal(null)} onSaved={() => { setModal(null); refresh(); }} />}
+      {modal && modal.type === "count" && <CountSheet skus={skus} onHand={onHand} cfg={cfg} onClose={() => setModal(null)} onSaved={() => { setModal(null); refresh(); }} />}
 
       {modal && modal.type === "blocked" && <BlockedFix modal={modal} onClose={() => setModal(null)}
         onSave={async (e) => { await addLedger(e); setModal(null); refresh(); }} />}
 
-      {modal && !["count", "blocked"].includes(modal.type) && <ActionModal modal={modal} skus={skus} onHand={onHand} onClose={() => setModal(null)}
+      {modal && !["count", "blocked"].includes(modal.type) && <ActionModal modal={modal} skus={skus} onHand={onHand} lines={lines} onClose={() => setModal(null)}
         onSave={async (e) => {
           await addLedger(e);
           if (modal.kasaniId) await setKasaniStatus(modal.kasaniId, "received");  // receive + close the ask together
@@ -227,26 +231,43 @@ function Inventory({ skus, conv, onHand, blocked, openModal }) {
 // ---------------- Sunday stock count (force-set on-hand) ----------------
 // Writes one `adjust` ledger row per line you actually changed. `adjust` sets on-hand to an
 // absolute value, so the counted figure wins over whatever the ledger had accumulated.
-function CountSheet({ skus, onHand, onClose, onSaved }) {
+function CountSheet({ skus, onHand, cfg = [], onClose, onSaved }) {
   const [q, setQ] = useState("");
   const [counted, setCounted] = useState({});     // "code|pm" -> typed string
+  const [units, setUnits] = useState({});         // "code|pm" -> variant
   const [note, setNote] = useState("Sunday stock count");
   const [busy, setBusy] = useState(false);
   const [err, setErr] = useState("");
 
+  // entry units for a packmat, from pack_config; only ones with a real factor are offered
+  const unitsFor = (pm) => {
+    const rows = cfg.filter((r) => r.packmat === pm && r.base_per_unit != null);
+    return rows.length ? rows : [{ variant: "default", unit_label: UNIT[pm] || "pcs", base_per_unit: 1 }];
+  };
+  const factorOf = (pm, variant) => {
+    const r = unitsFor(pm).find((x) => x.variant === (variant || "default"));
+    return r ? Number(r.base_per_unit) : 1;
+  };
+  const labelOf = (pm, variant) => {
+    const r = unitsFor(pm).find((x) => x.variant === (variant || "default"));
+    return r ? r.unit_label : (UNIT[pm] || "pcs");
+  };
+
   const rows = [];
   skus.forEach((s) => compsOf(s).forEach((pm) => {
     const key = `${s.code}|${pm}`;
-    rows.push({ key, code: s.code, desc: s.description, pm, now: Math.round(onHand[key] || 0) });
+    rows.push({ key, code: s.code, desc: s.description, pm, pmCode: codeFor(s, pm) || "", now: Math.round(onHand[key] || 0) });
   }));
   const f = rows
-    .filter((r) => !q || `${r.code} ${r.desc} ${LBL[r.pm]}`.toLowerCase().includes(q.toLowerCase()))
+    .filter((r) => !q || `${r.code} ${r.desc} ${LBL[r.pm]} ${r.pmCode}`.toLowerCase().includes(q.toLowerCase()))
     .sort((a, b) => (b.now > 0) - (a.now > 0) || a.code.localeCompare(b.code) || a.pm.localeCompare(b.pm));
 
-  // only lines with a number typed that actually differs from the computed on-hand
+  // a line counts only when a number is typed AND it differs from the computed on-hand
+  const baseOf = (r) => (Number(counted[r.key]) || 0) * factorOf(r.pm, units[r.key]);
   const changes = rows.filter((r) => {
     const v = counted[r.key];
-    return v !== undefined && v !== "" && Number(v) !== r.now && Number.isFinite(Number(v));
+    if (v === undefined || v === "" || !Number.isFinite(Number(v))) return false;
+    return Math.round(baseOf(r)) !== r.now;
   });
 
   const save = async () => {
@@ -254,8 +275,8 @@ function CountSheet({ skus, onHand, onClose, onSaved }) {
     setBusy(true);
     const { error } = await addLedgerMany(changes.map((r) => ({
       sku_code: r.code, packmat: r.pm, direction: "adjust",
-      qty_base: Number(counted[r.key]), line: "", shift: "",
-      note: `${note} (was ${r.now})`,
+      qty_base: Math.round(baseOf(r)), line: "", shift: "",
+      note: `${note} — counted ${Number(counted[r.key])} ${labelOf(r.pm, units[r.key])} (was ${r.now})`,
     })));
     setBusy(false);
     if (error) { setErr(error.message || String(error)); return; }
@@ -265,32 +286,45 @@ function CountSheet({ skus, onHand, onClose, onSaved }) {
   return (<Overlay wide onClose={onClose}>
     <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", gap: 12, flexWrap: "wrap" }}>
       <b>Sunday stock count</b>
-      <input placeholder="search SKU / packmat" value={q} onChange={(e) => setQ(e.target.value)} style={{ ...inp, width: 240 }} />
+      <input placeholder="search SKU / packmat code / description" value={q} onChange={(e) => setQ(e.target.value)} style={{ ...inp, width: 300 }} />
     </div>
     <div style={{ fontSize: 12, color: C.muted, margin: "6px 0 10px" }}>
       Type the counted quantity only on the lines you actually counted — blanks are left alone.
-      Saving force-sets on-hand for those lines and writes an <b>adjust</b> row to the ledger, so the correction is auditable.
+      Pick the unit you counted in; it is converted before saving. Each changed line writes an <b>adjust</b> row to the ledger.
     </div>
     <div style={{ maxHeight: "50vh", overflowY: "auto" }}>
       <table style={{ width: "100%", borderCollapse: "collapse" }}>
-        <thead><tr><th style={th}>SKU</th><th style={th}>Description</th><th style={th}>Packmat</th><th style={th}>System</th><th style={th}>Counted</th><th style={th}>Diff</th></tr></thead>
-        <tbody>{f.map((r) => {
-          const v = counted[r.key];
-          const has = v !== undefined && v !== "" && Number.isFinite(Number(v));
-          const d = has ? Number(v) - r.now : 0;
-          return (<tr key={r.key}>
-            <td style={{ ...td, fontWeight: 600 }}>{r.code}</td>
-            <td style={{ ...td, color: C.muted, fontSize: 13 }}>{(r.desc || "").slice(0, 24)}</td>
-            <td style={td}>{LBL[r.pm]}</td>
-            <td style={td}>{r.now} {UNIT[r.pm]}</td>
-            <td style={td}><input type="number" value={v ?? ""} placeholder="—"
-              onChange={(e) => setCounted({ ...counted, [r.key]: e.target.value })}
-              style={{ ...inp, width: 100, borderColor: has && d !== 0 ? C.amber : C.line }} /></td>
-            <td style={{ ...td, fontWeight: 600, color: !has || d === 0 ? C.muted : d > 0 ? C.green : C.red }}>
-              {!has || d === 0 ? "—" : (d > 0 ? `+${d}` : d)}
-            </td>
-          </tr>);
-        })}</tbody>
+        <thead><tr>
+          <th style={th}>SKU</th><th style={th}>Packmat code</th><th style={th}>Description</th><th style={th}>Packmat</th>
+          <th style={th}>System</th><th style={th}>Counted</th><th style={th}>Unit</th><th style={th}>Diff</th>
+        </tr></thead>
+        <tbody>{f.length === 0 ? <tr><td style={td} colSpan={8}>Nothing matches.</td></tr> :
+          f.map((r) => {
+            const v = counted[r.key];
+            const has = v !== undefined && v !== "" && Number.isFinite(Number(v));
+            const opts = unitsFor(r.pm);
+            const d = has ? Math.round(baseOf(r)) - r.now : 0;
+            return (<tr key={r.key}>
+              <td style={{ ...td, fontWeight: 600 }}>{r.code}</td>
+              <td style={{ ...td, fontFamily: "monospace", fontSize: 12, color: r.pmCode ? C.ink : C.muted }}>{r.pmCode || "—"}</td>
+              <td style={{ ...td, color: C.muted, fontSize: 13 }}>{(r.desc || "").slice(0, 20)}</td>
+              <td style={td}>{LBL[r.pm]}</td>
+              <td style={td}>{r.now} {UNIT[r.pm]}</td>
+              <td style={td}><input type="number" value={v ?? ""} placeholder="—"
+                onChange={(e) => setCounted({ ...counted, [r.key]: e.target.value })}
+                style={{ ...inp, width: 92, borderColor: has && d !== 0 ? C.amber : C.line }} /></td>
+              <td style={td}>{opts.length > 1
+                ? <select value={units[r.key] || "default"} onChange={(e) => setUnits({ ...units, [r.key]: e.target.value })} style={{ ...inp, width: 116, fontSize: 13 }}>
+                    {opts.map((o) => <option key={o.variant} value={o.variant}>{o.unit_label}</option>)}
+                  </select>
+                : <span style={{ fontSize: 13, color: C.muted }}>{opts[0].unit_label}</span>}</td>
+              <td style={{ ...td, fontWeight: 600, color: !has || d === 0 ? C.muted : d > 0 ? C.green : C.red }}>
+                {!has || d === 0 ? "—" : (d > 0 ? `+${d}` : d)}
+                {has && factorOf(r.pm, units[r.key]) !== 1 &&
+                  <div style={{ fontSize: 11, fontWeight: 400, color: C.muted }}>= {Math.round(baseOf(r))} {UNIT[r.pm]}</div>}
+              </td>
+            </tr>);
+          })}</tbody>
       </table>
     </div>
     <input placeholder="note on the ledger rows" value={note} onChange={(e) => setNote(e.target.value)} style={{ ...inp, width: "100%", marginTop: 10 }} />
@@ -810,7 +844,7 @@ function sortSkusByStock(skus, onHand) {
 }
 
 // ---------------- Action modal (Issue / Incoming / Return / Block) ----------------
-function ActionModal({ modal, skus, onHand, onClose, onSave }) {
+function ActionModal({ modal, skus, onHand, lines = [], onClose, onSave }) {
   const titles = { issue: "Issue packmat to line", receive: "Incoming from Kasani", return: "Return unused", block: "Block / reject" };
   const [sku, setSku] = useState(modal.sku || "");
   const s = skus.find((x) => x.code === sku);
@@ -848,7 +882,8 @@ function ActionModal({ modal, skus, onHand, onClose, onSave }) {
     {f !== 1 && Number(qty) > 0 && <div style={{ fontSize: 12, color: C.slate, marginTop: 6 }}>= {qb} {baseUnit(packmat)}</div>}
     {sku && packmat && <div style={{ fontSize: 12, color: C.muted, marginTop: 6 }}>On-hand now: {Math.round(avail)} {UNIT[packmat]}</div>}
     {["issue", "return"].includes(modal.type) && <div style={{ display: "flex", gap: 8, marginTop: 8 }}>
-      <div style={{ flex: 1 }}><label style={{ fontSize: 12 }}>{modal.type === "return" ? "Returned by line" : "Machine / line"}</label><br /><input value={line} onChange={(e) => setLine(e.target.value)} placeholder="e.g. K9" style={{ ...inp, width: "100%" }} /></div>
+      <div style={{ flex: 1 }}><label style={{ fontSize: 12 }}>{modal.type === "return" ? "Returned by line" : "Machine / line"}</label><br /><input list="pm-lines" value={line} onChange={(e) => setLine(e.target.value)} placeholder="e.g. K9 — optional" style={{ ...inp, width: "100%" }} />
+        <datalist id="pm-lines">{lines.map((l) => <option key={l.line} value={l.line}>{l.label || ""}</option>)}</datalist></div>
       <div style={{ width: 90 }}><label style={{ fontSize: 12 }}>Shift</label><br /><select value={shift} onChange={(e) => setShift(e.target.value)} style={{ ...inp, width: "100%" }}>{SHIFTS.map((x) => <option key={x}>{x}</option>)}</select></div>
     </div>}
     <button onClick={submit} style={{ ...btn(C.slate), width: "100%", marginTop: 14 }}>Save</button>

@@ -88,3 +88,51 @@ export function findByCode(skus, code) {
 export const nowStamp = () => new Date().toISOString();
 export const todayStr = () => new Date().toISOString().slice(0, 10);
 export const ghost = { padding: "8px 14px", background: "#fff", color: C.slate, border: `1px solid ${C.line}`, borderRadius: 8, fontWeight: 600, cursor: "pointer" };
+
+// ---- IST shift model: A 06:00-14:00, B 14:00-22:00, C 22:00-06:00 (next morning) ----
+// Timestamps are stored as timestamptz; we shift into IST before bucketing so the answer
+// does not change with the viewer's machine timezone.
+const IST_MS = 330 * 60000;
+export const SHIFT_HOURS = { A: "06:00–14:00", B: "14:00–22:00", C: "22:00–06:00" };
+export function istOf(ts) { return new Date(new Date(ts).getTime() + IST_MS); }
+// which production shift a timestamp falls in, and which DAY that shift belongs to
+export function shiftOf(ts) {
+  const d = istOf(ts);
+  const h = d.getUTCHours();
+  const day = (off) => new Date(d.getTime() - off).toISOString().slice(0, 10);
+  if (h >= 6 && h < 14) return { shift: "A", date: day(0) };
+  if (h >= 14 && h < 22) return { shift: "B", date: day(0) };
+  return { shift: "C", date: day(h < 6 ? 86400000 : 0) };   // after midnight = previous day's C
+}
+export const istToday = () => istOf(Date.now()).toISOString().slice(0, 10);
+export function currentShift() { return shiftOf(Date.now()); }
+// the next N shifts from now, as {date, shift} — used for "needed in the next 3 shifts"
+export function nextShifts(n = 3) {
+  const order = ["A", "B", "C"];
+  let { shift, date } = currentShift();
+  const out = [{ date, shift }];
+  for (let i = 1; i < n; i++) {
+    const idx = order.indexOf(shift);
+    if (idx === 2) { shift = "A"; date = new Date(new Date(date).getTime() + 86400000).toISOString().slice(0, 10); }
+    else shift = order[idx + 1];
+    out.push({ date, shift });
+  }
+  return out;
+}
+
+// ---- FG capability: how many tonnes of finished goods a stock position can actually pack ----
+// You need EVERY component, so the answer is the smallest of them — that packmat is the
+// binding constraint and the one worth chasing.
+export function fgCapable(s, onHand, conv) {
+  const comps = compsOf(s);
+  if (!comps.length) return { t: 0, limit: null, per: {} };
+  const per = {};
+  let t = Infinity, limit = null;
+  for (const pm of comps) {
+    const qty = Math.max(0, onHand[`${s.code}|${pm}`] || 0);
+    const f = fgEquiv(pm, qty, s, conv);
+    per[pm] = { qty, t: f };
+    if (f < t) { t = f; limit = pm; }
+  }
+  return { t: t === Infinity ? 0 : t, limit, per };
+}

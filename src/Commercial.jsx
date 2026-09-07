@@ -8,9 +8,9 @@ import {
   updateConsignment, kasaniOnHand, loadSkusK, loadConversionK, remainingOf,
 } from "./dataKasani";
 import { loadLedger } from "./data";
-import { loadKasaniRequestsAll } from "./dataKasani";
+import { loadKasaniRequestsAll, loadPhasing, replacePhasing, replaceProduction } from "./dataKasani";
 import Analytics from "./Analytics";
-import { LBL, BASE_UNIT, compsOf, fgEquiv, theo, grStatus, C, btn, ghost, card, inp, th, td, readSheet, exportXlsx, norm } from "./shared";
+import { LBL, BASE_UNIT, compsOf, fgEquiv, theo, grStatus, istToday, C, btn, ghost, card, inp, th, td, readSheet, exportXlsx, norm } from "./shared";
 
 export default function Commercial() {
   const [tab, setTab] = useState("ilt");
@@ -24,12 +24,15 @@ export default function Commercial() {
   const [msg, setMsg] = useState("");
   const [kreqs, setKreqs] = useState([]);
   const [days, setDays] = useState(7);
+  const [phasing, setPhasing] = useState([]);
+  const [uploadMsg, setUploadMsg] = useState("");
 
   const refresh = async () => {
     setSkus(await loadSkusK()); setConv(await loadConversionK());
     setLedger(await loadLedger()); setProd(await loadProduction());
     setCons(await loadConsignments()); setDisp(await loadDispatches());
     setKreqs(await loadKasaniRequestsAll());
+    setPhasing(await loadPhasing());
   };
   useEffect(() => { refresh(); }, []);
 
@@ -112,6 +115,64 @@ export default function Commercial() {
     }));
     exportXlsx(`kasani_gr_${today}.xlsx`, rows.length ? rows : [{ note: "no receipts" }]);
   };
+
+  // ---------- analytics uploads ----------
+  // DPR — the daily production report, one per shift. `line` is optional; when the sheet
+  // carries it, packmat loss is worked out per line. Re-uploading a date+shift replaces it.
+  const uploadProduction = (file, planDate, shift) => readSheet(file, async (aoa) => {
+    let hr = aoa.findIndex((r) => (r || []).some((x) => /sku|cbu|code/i.test(String(x))));
+    if (hr < 0) hr = 0;
+    const H = (aoa[hr] || []).map(norm);
+    const iId = H.findIndex((h) => /sku|cbu|code/.test(h));
+    const iT = H.findIndex((h) => /tonne|ton|fg|qty|produced|output|total/.test(h));
+    const iLn = H.findIndex((h) => /line|machine/.test(h));
+    const rows = [];
+    for (let r = hr + 1; r < aoa.length; r++) {
+      const row = aoa[r] || [];
+      const code = String(row[iId] || "").trim();
+      const t = Number(String(row[iT] || "").replace(/[^0-9.]/g, "")) || 0;
+      if (!code || !t) continue;
+      rows.push({
+        plan_date: planDate, shift, sku_code: code, tonnes: t,
+        line: iLn >= 0 ? String(row[iLn] || "").trim().toUpperCase() || null : null,
+      });
+    }
+    if (!rows.length) { setUploadMsg("No rows found — the DPR needs a SKU code and tonnes column."); return; }
+    const { error } = await replaceProduction(planDate, shift, rows);
+    const withLine = rows.filter((r) => r.line).length;
+    setUploadMsg(error ? `Error: ${error.message || error}`
+      : `DPR loaded: ${rows.length} SKU(s) for ${planDate} shift ${shift}${withLine ? `, ${withLine} tagged to a line` : " (no line column — loss will be shown per SKU, not per line)"}.`);
+    if (!error) refresh();
+  });
+
+  // Phasing. Daily = SKU + tonnes + shift, for one date. Weekly = SKU + tonnes, no shift.
+  const uploadPhasing = (file, planDate, horizon) => readSheet(file, async (aoa) => {
+    let hr = aoa.findIndex((r) => (r || []).some((x) => /sku|cbu|code/i.test(String(x))));
+    if (hr < 0) hr = 0;
+    const H = (aoa[hr] || []).map(norm);
+    const iId = H.findIndex((h) => /sku|cbu|code/.test(h));
+    const iT = H.findIndex((h) => /demand|tonne|ton|qty|plan|total/.test(h));
+    const iSh = H.findIndex((h) => /shift|needed/.test(h));
+    const rows = [];
+    let noShift = 0;
+    for (let r = hr + 1; r < aoa.length; r++) {
+      const row = aoa[r] || [];
+      const code = String(row[iId] || "").trim();
+      const t = Number(String(row[iT] || "").replace(/[^0-9.]/g, "")) || 0;
+      if (!code || !t) continue;
+      let shift = null;
+      if (horizon === "day") {
+        shift = (String(iSh >= 0 ? row[iSh] : "").trim().toUpperCase().match(/[ABC]/) || [null])[0];
+        if (!shift) noShift++;
+      }
+      rows.push({ plan_date: planDate, shift, sku_code: code, tonnes: t, horizon });
+    }
+    if (!rows.length) { setUploadMsg("No rows found — expected SKU code and demand in tonnes."); return; }
+    const { error } = await replacePhasing([planDate], rows, horizon);
+    setUploadMsg(error ? `Error: ${error.message || error}`
+      : `${horizon === "day" ? "Daily" : "Weekly"} plan loaded: ${rows.length} SKU(s) for ${planDate}${noShift ? `. ${noShift} row(s) had no A/B/C shift — counted in the day total only.` : "."}`);
+    if (!error) refresh();
+  });
 
   const kOn = kasaniOnHand(cons);
   const grPending = cons.filter((c) => c.status === "pending").length;
@@ -266,7 +327,9 @@ export default function Commercial() {
       </div>
     </div>}
 
-    {tab === "analytics" && <Analytics ledger={ledger} cons={cons} disp={disp} reqs={kreqs} skus={skus} days={days} setDays={setDays} />}
+    {tab === "analytics" && <Analytics ledger={ledger} cons={cons} disp={disp} reqs={kreqs} skus={skus} conv={conv}
+      production={prod} phasing={phasing} days={days} setDays={setDays}
+      onUploadProduction={uploadProduction} onUploadPhasing={uploadPhasing} uploadMsg={uploadMsg} />}
 
     {/* ---------------- loss ---------------- */}
     {tab === "loss" && <div style={card}>

@@ -7,8 +7,8 @@
 // for that line, those exact material codes win instead. Either way there is a
 // "show every SKU" escape hatch, because machines get re-set to other weights.
 import React, { useEffect, useMemo, useState } from "react";
-import { loadSkusK, loadLinesMap, loadLineMaterials, addRequestRow, loadRequestsForLine } from "../dataKasani";
-import { LBL, BASE_UNIT, compsOf, codeFor, C } from "../shared";
+import { loadSkusK, loadLinesMap, loadLineMaterials, loadPackConfig, addRequestRow, loadRequestsForLine } from "../dataKasani";
+import { LBL, BASE_UNIT, compsOf, codeFor, currentShift, SHIFT_HOURS, C } from "../shared";
 
 const norm = (x) => String(x || "").trim().toUpperCase().replace(/[\s\-_.]/g, "");
 // same canonical buckets compsOf uses, so line config and SKU master always agree
@@ -19,12 +19,12 @@ export default function BCECall({ presetLine }) {
   const [skus, setSkus] = useState([]);
   const [lmap, setLmap] = useState([]);
   const [lmat, setLmat] = useState([]);
+  const [pcfg, setPcfg] = useState([]);   // pack_config: entry units. `cfg` below is the LINE config.
   const [line, setLine] = useState(presetLine || "");
   const [typed, setTyped] = useState("");
   const [sku, setSku] = useState("");
-  const [packmat, setPackmat] = useState("");
-  const [qty, setQty] = useState("");
-  const [shift, setShift] = useState("A");
+  const [qtys, setQtys] = useState({});      // packmat -> qty; a line runs several at once
+  const [uvar, setUvar] = useState({});      // packmat -> which unit they counted in
   const [showAll, setShowAll] = useState(false);
   const [q, setQ] = useState("");
   const [recent, setRecent] = useState([]);
@@ -32,7 +32,8 @@ export default function BCECall({ presetLine }) {
   const [busy, setBusy] = useState(false);
 
   useEffect(() => { (async () => {
-    setSkus(await loadSkusK()); setLmap(await loadLinesMap()); setLmat(await loadLineMaterials());
+    setSkus(await loadSkusK()); setLmap(await loadLinesMap());
+    setLmat(await loadLineMaterials()); setPcfg(await loadPackConfig());
   })(); }, []);
   useEffect(() => { if (line) loadRequestsForLine(line).then(setRecent); }, [line, done]);
 
@@ -58,9 +59,28 @@ export default function BCECall({ presetLine }) {
   const list = pool.filter((s) => !q || `${s.code} ${s.description} ${s.primary_code} ${s.outer_code}`.toLowerCase().includes(q.toLowerCase()));
 
   const s = skus.find((x) => x.code === sku);
-  // only the packmats this line handles, unless we are showing everything
-  const comps = s ? compsOf(s).filter((pm) => showAll || !cfg || !cfg.primary_type || pm !== "divider") : [];
-  useEffect(() => { if (s && !comps.includes(packmat)) setPackmat(comps[0] || ""); }, [sku]); // eslint-disable-line
+  // Everything this SKU needs. A divider is required at 1 kg and above even when the SKU
+  // master does not carry the flag, so add it rather than let the line run short.
+  const comps = (() => {
+    if (!s) return [];
+    const a = compsOf(s);
+    if (Number(s.weight) >= 1000 && !a.includes("divider")) a.push("divider");
+    return a;
+  })();
+  useEffect(() => { setQtys({}); setUvar({}); }, [sku]);
+
+  // What this line counts in. A roll of laminate, a box of cartons, a bundle of CLD —
+  // never kg or loose pieces. Only units with a real factor behind them are offered.
+  const unitsFor = (pm) => {
+    const rows = pcfg.filter((r) => r.packmat === pm && r.base_per_unit != null)
+      .sort((a, b) => (a.sort_order || 0) - (b.sort_order || 0));
+    return rows.length ? rows : [{ variant: "default", unit_label: BASE_UNIT[pm] || "pcs", base_per_unit: 1 }];
+  };
+  const unitRow = (pm) => {
+    const o = unitsFor(pm);
+    return o.find((x) => x.variant === (uvar[pm] || o[0].variant)) || o[0];
+  };
+  const baseQty = (pm) => (Number(qtys[pm]) || 0) * Number(unitRow(pm).base_per_unit || 1);
 
   const machines = [...lmap].filter((l) => l.active !== false).sort((a, b) => (a.sort_order || 99) - (b.sort_order || 99));
   const groups = [...new Set(machines.map((m) => m.group_name || "MACHINES"))];
@@ -68,20 +88,29 @@ export default function BCECall({ presetLine }) {
   const pickLine = (name) => {
     const hit = lmap.find((l) => norm(l.line) === norm(name));
     if (!hit) return false;
-    setLine(hit.line); setTyped(""); setSku(""); setPackmat(""); setQty(""); setQ(""); setShowAll(false);
+    setLine(hit.line); setTyped(""); setSku(""); setQtys({}); setQ(""); setShowAll(false);
     return true;
   };
   const submitTyped = () => { if (!pickLine(typed)) setDone(`No machine called "${typed}".`); };
 
+  // Only the packmats with a number typed in are sent. Leaving CLD blank while asking
+  // for cartons simply means no CLD request is raised.
+  const wanted = comps.filter((pm) => Number(qtys[pm]) > 0);
   const call = async () => {
-    const n = Number(qty);
-    if (!line || !sku || !packmat || !n) return;
+    if (!line || !sku || !wanted.length) return;
     setBusy(true);
-    const { error } = await addRequestRow({ line, sku_code: sku, packmat, qty_base: n, shift, status: "open" });
+    const now = currentShift();          // the clock decides the shift, nobody types it
+    const failed = [];
+    for (const pm of wanted) {
+      const { error } = await addRequestRow({
+        line, sku_code: sku, packmat: pm, qty_base: baseQty(pm), shift: now.shift, status: "open",
+      });
+      if (error) failed.push(LBL[pm]);
+    }
     setBusy(false);
-    if (error) { setDone(`Could not send: ${error.message || error}`); return; }
-    setDone(`✓ Sent to PM store — ${n} ${BASE_UNIT[packmat]} of ${LBL[packmat]} for ${sku}`);
-    setQty("");
+    if (failed.length) { setDone(`Could not send: ${failed.join(", ")}`); return; }
+    setDone(`✓ Sent to PM store — ${wanted.map((pm) => `${Number(qtys[pm])} ${unitRow(pm).unit_label} ${LBL[pm]}`).join(" + ")} for ${sku}`);
+    setQtys({}); setUvar({});
     setTimeout(() => setDone(""), 4000);
   };
 
@@ -124,8 +153,11 @@ export default function BCECall({ presetLine }) {
       <div>
         <h2 style={{ color: C.slate, margin: 0 }}>{cfg ? cfg.label || line : line}</h2>
         <div style={{ fontSize: 13, color: C.muted }}>{capability || "all materials"}{codesForLine.size ? ` · ${codesForLine.size} mapped codes` : ""}</div>
+        <div style={{ fontSize: 12, color: C.green, marginTop: 2 }}>
+          Shift {currentShift().shift} &middot; {SHIFT_HOURS[currentShift().shift]} — recorded automatically
+        </div>
       </div>
-      <button onClick={() => { setLine(""); setSku(""); setDone(""); }} style={{ padding: "8px 12px", borderRadius: 8, border: `1px solid ${C.line}`, background: "#fff", cursor: "pointer", fontWeight: 600 }}>Change</button>
+      <button onClick={() => { setLine(""); setSku(""); setQtys({}); setDone(""); }} style={{ padding: "8px 12px", borderRadius: 8, border: `1px solid ${C.line}`, background: "#fff", cursor: "pointer", fontWeight: 600 }}>Change</button>
     </div>
 
     <label style={lbl}>What do you need?</label>
@@ -148,31 +180,46 @@ export default function BCECall({ presetLine }) {
     {!showAll && onLine.length > 0 && <div style={{ fontSize: 12, color: C.muted, marginTop: 2 }}>Showing {onLine.length} of {skus.length} SKUs this machine runs.</div>}
 
     {s && <>
-      <label style={lbl}>Which packaging?</label>
-      <div style={{ display: "flex", gap: 8, flexWrap: "wrap", marginTop: 6 }}>
-        {comps.map((pm) => (<button key={pm} onClick={() => setPackmat(pm)} style={{
-          flex: "1 1 100px", padding: 16, fontSize: 17, fontWeight: 700, borderRadius: 10, cursor: "pointer",
-          border: `2px solid ${packmat === pm ? C.slate : C.line}`,
-          background: packmat === pm ? C.slate : "#fff", color: packmat === pm ? "#fff" : C.ink,
-        }}>{LBL[pm]}<div style={{ fontSize: 11, fontWeight: 400, opacity: 0.8 }}>{codeFor(s, pm) || ""}</div></button>))}
-      </div>
+      <label style={lbl}>How much of each?</label>
+      <div style={{ fontSize: 13, color: C.muted, marginTop: 2 }}>Fill in only what you need. Leave a box empty and it will not be asked for.</div>
+      {comps.map((pm) => {
+        const on = Number(qtys[pm]) > 0;
+        const opts = unitsFor(pm);
+        const row = unitRow(pm);
+        const conv = Number(row.base_per_unit || 1);
+        return (<div key={pm} style={{
+          marginTop: 10, padding: 12,
+          border: `2px solid ${on ? C.slate : C.line}`, borderRadius: 12, background: on ? "#f8fafc" : "#fff",
+        }}>
+          <div style={{ display: "flex", alignItems: "center", gap: 12 }}>
+            <div style={{ flex: 1 }}>
+              <div style={{ fontSize: 18, fontWeight: 700 }}>{LBL[pm]}</div>
+              <div style={{ fontSize: 12, color: C.muted, fontFamily: "monospace" }}>
+                {codeFor(s, pm) || (pm === "divider" ? "divider" : "—")}
+              </div>
+              {pm === "divider" && Number(s.weight) >= 1000 &&
+                <div style={{ fontSize: 11, color: C.amber, fontWeight: 600 }}>needed at {s.weight} g</div>}
+            </div>
+            <input type="number" inputMode="numeric" placeholder="0" value={qtys[pm] ?? ""}
+              onChange={(e) => setQtys({ ...qtys, [pm]: e.target.value })}
+              style={{ width: 104, fontSize: 24, fontWeight: 700, textAlign: "center", padding: 12, borderRadius: 10, border: `1px solid ${C.line}` }} />
+          </div>
+          <div style={{ display: "flex", gap: 6, marginTop: 10, flexWrap: "wrap", alignItems: "center" }}>
+            {opts.map((o) => (<button key={o.variant} onClick={() => setUvar({ ...uvar, [pm]: o.variant })} style={{
+              padding: "8px 14px", fontSize: 15, fontWeight: 700, borderRadius: 8, cursor: "pointer",
+              border: `2px solid ${row.variant === o.variant ? C.slate : C.line}`,
+              background: row.variant === o.variant ? C.slate : "#fff", color: row.variant === o.variant ? "#fff" : C.ink,
+            }}>{o.unit_label}</button>))}
+            {on && conv !== 1 && <span style={{ fontSize: 13, color: C.muted }}>= {baseQty(pm)} {BASE_UNIT[pm]}</span>}
+          </div>
+        </div>);
+      })}
 
-      <div style={{ display: "flex", gap: 10 }}>
-        <div style={{ flex: 1 }}>
-          <label style={lbl}>How many ({packmat ? BASE_UNIT[packmat] : "units"})</label>
-          <input type="number" inputMode="numeric" value={qty} onChange={(e) => setQty(e.target.value)} style={{ ...big, fontSize: 24, fontWeight: 700, textAlign: "center" }} />
-        </div>
-        <div style={{ width: 120 }}>
-          <label style={lbl}>Shift</label>
-          <select value={shift} onChange={(e) => setShift(e.target.value)} style={{ ...big, fontSize: 22, fontWeight: 700, textAlign: "center" }}><option>A</option><option>B</option><option>C</option></select>
-        </div>
-      </div>
-
-      <button onClick={call} disabled={busy || !packmat || !Number(qty)} style={{
+      <button onClick={call} disabled={busy || !wanted.length} style={{
         width: "100%", marginTop: 22, padding: 20, fontSize: 22, fontWeight: 700, borderRadius: 12, border: 0,
-        cursor: !packmat || !Number(qty) ? "not-allowed" : "pointer",
-        background: !packmat || !Number(qty) ? "#94a3b8" : C.slate, color: "#fff",
-      }}>{busy ? "Sending…" : "Call packaging"}</button>
+        cursor: wanted.length ? "pointer" : "not-allowed",
+        background: wanted.length ? C.slate : "#94a3b8", color: "#fff",
+      }}>{busy ? "Sending…" : wanted.length > 1 ? `Call ${wanted.length} items` : "Call packaging"}</button>
     </>}
 
     {done && <div style={{ marginTop: 14, padding: 14, background: done.startsWith("✓") ? "#eafaf0" : "#fef2f2", color: done.startsWith("✓") ? C.green : C.red, borderRadius: 10, textAlign: "center", fontWeight: 600 }}>{done}</div>}

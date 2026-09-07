@@ -260,3 +260,36 @@ export async function loadRequestsForLine(line) {
   if (error) { console.error("loadRequestsForLine", error); return []; }
   return data || [];
 }
+
+// ---- phasing (demand plan) ----
+export async function loadPhasing() {
+  if (!hasSupabase) return [];
+  const { data, error } = await supabase.from("phasing").select("*").order("plan_date", { ascending: false });
+  if (error) { console.error("loadPhasing", error); return []; }
+  return data || [];
+}
+// Re-uploading a date replaces only that horizon, so loading the daily plan never
+// wipes the weekly one (and vice versa).
+export async function replacePhasing(planDates, rows, horizon = "day") {
+  if (!hasSupabase) return { error: "no db" };
+  for (const d of [...new Set(planDates)]) {
+    const { error } = await supabase.from("phasing").delete().eq("plan_date", d).eq("horizon", horizon);
+    if (error) { console.error("replacePhasing delete", error); return { error }; }
+  }
+  if (!rows.length) return { error: null };
+  const { error } = await supabase.from("phasing").insert(rows);
+  if (error) console.error("replacePhasing insert", error);
+  return { error };
+}
+// same idea for FG produced: one upload per date+shift replaces that slot
+export async function replaceProduction(planDate, shift, rows) {
+  if (!hasSupabase) return { error: "no db" };
+  let q = supabase.from("production").delete().eq("plan_date", planDate);
+  q = shift ? q.eq("shift", shift) : q.is("shift", null);
+  const { error: e1 } = await q;
+  if (e1) { console.error("replaceProduction delete", e1); return { error: e1 }; }
+  if (!rows.length) return { error: null };
+  const { error } = await supabase.from("production").insert(rows);
+  if (error) console.error("replaceProduction insert", error);
+  return { error };
+}

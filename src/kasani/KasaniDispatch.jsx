@@ -31,6 +31,7 @@ export default function KasaniDispatch() {
   const [ilt, setIlt] = useState(null);        // truck being sent
   const [msg, setMsg] = useState("");
   const [busy, setBusy] = useState(false);
+  const [showSent, setShowSent] = useState(false);   // sent requests are hidden by default
 
   const refresh = async () => {
     setSkus(await loadSkusK());
@@ -61,9 +62,11 @@ export default function KasaniDispatch() {
     return a + (cap ? (Number(l.qty_base) || 0) / cap : 0);
   }, 0);
 
-  // not-sent first, sent to the bottom
+  // Active work only, unless you ask for the history. Sent requests are capped at 30 —
+  // the full record lives in Commercial, this screen is for what still has to go out.
   const openReqs = reqs.filter((r) => r.status !== "sent");
-  const sentReqs = reqs.filter((r) => r.status === "sent");
+  const sentAll = reqs.filter((r) => r.status === "sent");
+  const sentReqs = showSent ? sentAll.slice(0, 30) : [];
   const chosen = openReqs.filter((r) => sel[r.id]);
   const noCap = [...new Set(chosen.map((r) => r.packmat))].filter((pm) => !capBase(pm));
 
@@ -207,13 +210,18 @@ export default function KasaniDispatch() {
     {/* ---------- requests ---------- */}
     <div style={card}>
       <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", gap: 12, flexWrap: "wrap", marginBottom: 8 }}>
-        <b>Requests from PM store — {openReqs.length} to send{sentReqs.length ? `, ${sentReqs.length} already sent` : ""}</b>
-        <button onClick={refresh} style={ghost}>Refresh</button>
+        <b>Requests from PM store — {openReqs.length} to send</b>
+        <div style={{ display: "flex", gap: 8, alignItems: "center" }}>
+          {sentAll.length > 0 && <button onClick={() => setShowSent(!showSent)} style={ghost}>
+            {showSent ? "Hide sent" : `Show sent (${sentAll.length})`}
+          </button>}
+          <button onClick={refresh} style={ghost}>Refresh</button>
+        </div>
       </div>
       <div style={{ fontSize: 13, color: C.muted, marginBottom: 10 }}>
         <b>Priority 1 = shift A</b> (needed now), then 2 = B, 3 = C. Open <b>Details</b> to see the description and which invoice to pick from.
       </div>
-      {reqs.length === 0 ? <div style={{ color: C.muted, padding: 10 }}>Nothing pending. When the PM store presses “Ask Kasani”, it appears here.</div> :
+      {openReqs.length === 0 && !sentReqs.length ? <div style={{ color: C.muted, padding: 10 }}>Nothing pending. When the PM store presses “Ask Kasani”, it appears here.</div> :
         <div style={{ maxHeight: 420, overflowY: "auto" }}>
           <table style={{ width: "100%", borderCollapse: "collapse" }}>
             <thead><tr>
@@ -222,7 +230,8 @@ export default function KasaniDispatch() {
             </tr></thead>
             <tbody>
               {openReqs.map((r) => <ReqRow key={r.id} r={r} />)}
-              {sentReqs.length > 0 && <tr><td colSpan={9} style={{ ...td, background: "#f1f5f9", fontSize: 12, fontWeight: 700, color: C.muted }}>ALREADY SENT</td></tr>}
+              {sentReqs.length > 0 && <tr><td colSpan={9} style={{ ...td, background: "#f1f5f9", fontSize: 12, fontWeight: 700, color: C.muted }}>
+                ALREADY SENT — most recent {sentReqs.length}{sentAll.length > sentReqs.length ? ` of ${sentAll.length}` : ""}</td></tr>}
               {sentReqs.map((r) => <ReqRow key={r.id} r={r} dim />)}
             </tbody>
           </table>
@@ -232,9 +241,15 @@ export default function KasaniDispatch() {
         ⚠ No truck capacity set for {noCap.map((p) => LBL[p] || p).join(", ")} — those lines are skipped. Set it in <b>Truck &amp; unit settings</b>.
       </div>}
 
-      <button onClick={plan} disabled={!chosen.length} style={{ ...btn(chosen.length ? C.slate : "#94a3b8"), marginTop: 12, cursor: chosen.length ? "pointer" : "not-allowed" }}>
-        Plan trucks for {chosen.length} request(s)
-      </button>
+      <div style={{ display: "flex", gap: 8, flexWrap: "wrap", marginTop: 12 }}>
+        <button onClick={plan} disabled={!chosen.length} style={{ ...btn(chosen.length ? C.slate : "#94a3b8"), cursor: chosen.length ? "pointer" : "not-allowed" }}>
+          Plan trucks for {chosen.length} request(s)
+        </button>
+        {/* a truck can be loaded without any store request behind it */}
+        <button onClick={() => { setSeq([[]]); setMsg("Empty truck started — use “+ Add material” to load it."); }} style={ghost}>
+          + Start an empty truck
+        </button>
+      </div>
       {msg && <div style={{ fontSize: 13, marginTop: 10, padding: "8px 10px", borderRadius: 8, background: /error|Nothing|Pick a/i.test(msg) ? "#fef2f2" : "#f0fdf4", color: /error|Nothing|Pick a/i.test(msg) ? C.red : C.green }}>{msg}</div>}
     </div>
 
