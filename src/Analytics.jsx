@@ -15,6 +15,7 @@ import {
   C, card, th, td, inp, exportXlsx,
 } from "./shared";
 import { remainingOf, kasaniOnHand, stockByMaterial } from "./dataKasani";
+import { computeOnHand } from "./data";
 
 const DAY = 86400000;
 const hrs = (a, b) => (new Date(b) - new Date(a)) / 3600000;
@@ -108,17 +109,9 @@ export default function Analytics({
   }, [production, moves, scope, slot, conv, skus]);
 
   // ---------- stock positions ----------
-  const pmOnHand = useMemo(() => {
-    const m = {};
-    ledger.forEach((r) => {
-      const k = `${r.sku_code}|${r.packmat}`; const q = Number(r.qty_base) || 0;
-      if (r.direction === "issue" || r.direction === "block") m[k] = (m[k] || 0) - q;
-      else if (r.direction === "adjust") m[k] = q;
-      else if (r.direction === "scrap") m[k] = m[k] || 0;
-      else m[k] = (m[k] || 0) + q;
-    });
-    return m;
-  }, [ledger]);
+  // one implementation, in data.js — it replays the ledger in time order so a stock
+  // count (`adjust`, an absolute value) is not undone by older rows
+  const pmOnHand = useMemo(() => computeOnHand(ledger), [ledger]);
   const kOnHand = useMemo(() => kasaniOnHand(cons), [cons]);
   const bothOnHand = useMemo(() => {
     const m = { ...pmOnHand };

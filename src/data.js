@@ -80,7 +80,13 @@ export async function loadLedger() {
 // only confirms it is never coming back (it clears out of the blocked figure instead).
 export function computeOnHand(ledgerRows) {
   const m = {};
-  for (const r of ledgerRows) {
+  // ORDER MATTERS. `adjust` sets an absolute value, so it must be replayed in the order the
+  // movements actually happened — loadLedger hands rows back newest-first for display, which
+  // would let older receipts and issues pile back on top of a stock count. Sort here rather
+  // than trusting the caller. `id` breaks ties: a bulk insert gives every row the same ts.
+  const rows = [...ledgerRows].sort((a, b) =>
+    String(a.ts || "").localeCompare(String(b.ts || "")) || (Number(a.id) || 0) - (Number(b.id) || 0));
+  for (const r of rows) {
     const k = `${r.sku_code}|${r.packmat}`; const q = Number(r.qty_base) || 0;
     const d = r.direction;
     if (d === "issue" || d === "block") m[k] = (m[k] || 0) - q;
