@@ -5,7 +5,7 @@ import Login from "./Login";
 import App from "./App.jsx";                    // existing PM store — untouched
 import KasaniHome from "./kasani/KasaniHome";
 import BCECall from "./bce/BCECall";
-import Leadership from "./Leadership";
+import Commercial from "./Commercial";
 import { C } from "./shared";
 
 export default function AppShell() {
@@ -18,7 +18,7 @@ export default function AppShell() {
 
   if (role === "store") return <><Bar /><App /></>;
   if (role === "bce") return <BCECall />;
-  if (role === "leadership") return <><Bar /><Leadership /></>;
+  if (role === "commercial") return <><Bar /><Commercial /></>;
   // Kasani gets its own plain home screen (Goods Received / Stock Status / Dispatch)
   if (role === "kasani") return <><Bar /><KasaniHome /></>;
   return null;

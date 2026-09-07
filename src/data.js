@@ -9,9 +9,22 @@ export async function loadSkus() {
   if (error) { console.error("loadSkus", error); return []; }
   return data || [];
 }
+// Postgres refuses an upsert that touches the same key twice in one statement
+// ("ON CONFLICT DO UPDATE command cannot affect row a second time"), so collapse
+// duplicates first. Later rows win — in a corrected sheet the lower row is the fix.
+export function dedupeBy(rows, keyFn) {
+  const m = new Map();
+  for (const r of rows) {
+    const k = keyFn(r);
+    if (k === "" || k == null) continue;
+    m.set(k, r);
+  }
+  return [...m.values()];
+}
 export async function upsertSkus(rows) {
   if (!hasSupabase) return { error: "no db" };
-  const { error } = await supabase.from("skus").upsert(rows, { onConflict: "code" });
+  const clean = dedupeBy(rows, (r) => String(r.code || "").trim());
+  const { error } = await supabase.from("skus").upsert(clean, { onConflict: "code" });
   if (error) console.error("upsertSkus", error);
   return { error };
 }
@@ -109,6 +122,7 @@ export async function closeRequest(id) {
 // ---------- Conversion upload (Settings) ----------
 export async function upsertConversion(rows) {
   if (!hasSupabase) return { error: "no db" };
+  rows = dedupeBy(rows, (r) => r.weight);   // same weight twice would fail the same way
   const { error } = await supabase.from("conversion").upsert(rows, { onConflict: "weight" });
   if (error) console.error("upsertConversion", error);
   return { error };

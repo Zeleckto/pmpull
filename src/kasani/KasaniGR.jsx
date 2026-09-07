@@ -3,7 +3,7 @@
 // Material code and SKU fill each other in, so they only ever type one of them.
 // GRN No. / GRN Date are optional here: leadership adds them later.
 import React, { useEffect, useState } from "react";
-import { addConsignment, loadConsignments, loadSkusK, loadPackConfig } from "../dataKasani";
+import { addConsignment, updateConsignment, loadConsignments, loadSkusK, loadPackConfig } from "../dataKasani";
 import {
   LBL, compsOf, codeFor, BASE_UNIT, unitsFor, baseFactor, findByCode,
   KGRID_ROWS, C, btn, ghost, card, inp, th, td, todayStr,
@@ -26,6 +26,7 @@ export default function KasaniGR() {
   const [recent, setRecent] = useState([]);
   const [f, setF] = useState(BLANK);
   const [pick, setPick] = useState(null);     // code matched >1 SKU -> ask which
+  const [editing, setEditing] = useState(null); // consignment being corrected, or null
   const [msg, setMsg] = useState("");
   const [busy, setBusy] = useState(false);
 
@@ -55,29 +56,69 @@ export default function KasaniGR() {
   const qtyBase = factor == null ? null : (Number(f.qty) || 0) * factor;
   const unitLabel = (units.find((u) => u.variant === f.variant) || units[0] || {}).unit_label || BASE_UNIT[f.packmat] || "pcs";
 
+  // load an existing receipt back into the form to correct it
+  const startEdit = (c) => {
+    const mm = String(c.location || "").match(/^First\s+([A-E])-(\d+)$/);
+    setEditing(c);
+    setF({
+      invoice: c.invoice || "", invoice_date: String(c.invoice_date || "").slice(0, 10),
+      po_no: c.po_no || "", grn_no: c.grn_no || "", grn_date: String(c.grn_date || "").slice(0, 10),
+      transferred_to: c.transferred_to || "", barcode_ref: c.barcode_ref || "",
+      code: c.packmat_code || "", sku: c.sku_code || "", packmat: c.packmat || "",
+      qty: String(c.qty_entered != null ? c.qty_entered : (c.qty_base != null ? c.qty_base : "")),
+      variant: c.unit_variant || "default",
+      supplier: c.supplier || "", floor: c.floor || (mm ? "First" : "Ground"),
+      row: mm ? mm[1] : "A", col: mm ? Number(mm[2]) : 1, note: c.note || "",
+    });
+    setMsg("");
+    if (typeof window !== "undefined") window.scrollTo({ top: 0, behavior: "smooth" });
+  };
+  const cancelEdit = () => { setEditing(null); setF(BLANK); setMsg(""); };
+
   const save = async () => {
     if (!f.sku || !f.packmat || !Number(f.qty)) { setMsg("SKU, packmat and quantity are needed."); return; }
     if (qtyBase == null) { setMsg(`No conversion set for "${unitLabel}" — fill it in Truck & unit settings, or enter the quantity in ${BASE_UNIT[f.packmat]}.`); return; }
     setBusy(true);
-    const { error } = await addConsignment({
-      received_at: new Date().toISOString(),
+    const body = {
       invoice: f.invoice, invoice_date: f.invoice_date || null,
       po_no: f.po_no, grn_no: f.grn_no || null, grn_date: f.grn_date || null,
       transferred_to: f.transferred_to, barcode_ref: f.barcode_ref,
       sku_code: f.sku, packmat: f.packmat, packmat_code: autoCode,
       qty_base: qtyBase, qty_entered: Number(f.qty), unit: unitLabel, unit_variant: f.variant,
-      floor: f.floor, location, status: "pending", sample_sent: false,
-      supplier: f.supplier, note: f.note,
-    });
+      floor: f.floor, location, supplier: f.supplier, note: f.note,
+    };
+    let error;
+    if (editing) {
+      // A correction keeps the original receipt time. Whatever was already drawn off this
+      // invoice stays drawn off, so FIFO does not silently put stock back on the shelf.
+      const had = Number(editing.qty_base) || 0;
+      const left = editing.qty_remaining == null ? had : Number(editing.qty_remaining) || 0;
+      const used = Math.max(0, had - left);
+      ({ error } = await updateConsignment(editing.id, { ...body, qty_remaining: Math.max(0, qtyBase - used) }));
+    } else {
+      ({ error } = await addConsignment({
+        ...body, received_at: new Date().toISOString(), qty_remaining: qtyBase,
+        source: "gr", status: "pending", sample_sent: false,
+      }));
+    }
     setBusy(false);
     if (error) { setMsg(`Error: ${error.message || error}`); return; }
-    setMsg(`Saved — ${Math.round(qtyBase)} ${BASE_UNIT[f.packmat]} of ${LBL[f.packmat]} for ${f.sku} at ${location}.`);
+    setMsg(editing
+      ? `Corrected receipt #${editing.id} — now ${Math.round(qtyBase)} ${BASE_UNIT[f.packmat]} of ${LBL[f.packmat]} at ${location}.`
+      : `Saved — ${Math.round(qtyBase)} ${BASE_UNIT[f.packmat]} of ${LBL[f.packmat]} for ${f.sku} at ${location}.`);
+    setEditing(null);
     setF({ ...BLANK, supplier: f.supplier, po_no: f.po_no, transferred_to: f.transferred_to, floor: f.floor, row: f.row, col: f.col });
     refresh();
   };
 
   return (<div>
-    <div style={{ ...card, padding: 20 }}>
+    <div style={{ ...card, padding: 20, borderLeft: editing ? `6px solid ${C.amber}` : undefined }}>
+      {editing && <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", gap: 10, flexWrap: "wrap", background: "#fffbeb", border: "1px solid #fde68a", borderRadius: 8, padding: "8px 12px", marginBottom: 14 }}>
+        <span style={{ fontSize: 13, color: C.amber }}>
+          &#9998; Correcting receipt <b>#{editing.id}</b> ({editing.sku_code} &middot; {String(editing.received_at || editing.ts || "").slice(0, 16).replace("T", " ")}). The original received time is kept.
+        </span>
+        <button onClick={cancelEdit} style={ghost}>Cancel edit</button>
+      </div>}
       <Row>
         <Col><label style={lbl}>Invoice #</label>
           <input value={f.invoice} onChange={(e) => setF({ ...f, invoice: e.target.value })} placeholder="e.g. SKOL-01347" style={field} /></Col>
@@ -165,8 +206,10 @@ export default function KasaniGR() {
       {msg && <div style={{ fontSize: 14, marginBottom: 12, padding: "8px 10px", borderRadius: 8, background: /error|⚠|needed|No conversion/i.test(msg) ? "#fef2f2" : "#f0fdf4", color: /error|⚠|needed|No conversion/i.test(msg) ? C.red : C.green }}>{msg}</div>}
 
       <div style={{ display: "flex", gap: 10 }}>
-        <button onClick={() => { setF(BLANK); setMsg(""); }} style={{ ...ghost, flex: 1, padding: 14, fontSize: 16 }}>Clear form</button>
-        <button onClick={save} disabled={busy} style={{ ...btn(C.green), flex: 2, padding: 14, fontSize: 17 }}>{busy ? "Saving…" : "Save goods received"}</button>
+        <button onClick={editing ? cancelEdit : () => { setF(BLANK); setMsg(""); }} style={{ ...ghost, flex: 1, padding: 14, fontSize: 16 }}>{editing ? "Cancel edit" : "Clear form"}</button>
+        <button onClick={save} disabled={busy} style={{ ...btn(editing ? C.amber : C.green), flex: 2, padding: 14, fontSize: 17 }}>
+          {busy ? "Saving…" : editing ? "Save correction" : "Save goods received"}
+        </button>
       </div>
     </div>
 
@@ -184,8 +227,8 @@ export default function KasaniGR() {
       <b>Last 15 receipts</b>
       <div style={{ maxHeight: 300, overflowY: "auto", marginTop: 8 }}>
         <table style={{ width: "100%", borderCollapse: "collapse" }}>
-          <thead><tr><th style={th}>Received</th><th style={th}>Invoice</th><th style={th}>SKU</th><th style={th}>Packmat</th><th style={th}>Qty</th><th style={th}>Location</th><th style={th}>Supplier</th></tr></thead>
-          <tbody>{recent.length === 0 ? <tr><td style={td} colSpan={7}>Nothing received yet.</td></tr> :
+          <thead><tr><th style={th}>Received</th><th style={th}>Invoice</th><th style={th}>SKU</th><th style={th}>Packmat</th><th style={th}>Qty</th><th style={th}>Location</th><th style={th}>Supplier</th><th style={th}></th></tr></thead>
+          <tbody>{recent.length === 0 ? <tr><td style={td} colSpan={8}>Nothing received yet.</td></tr> :
             recent.map((c) => (<tr key={c.id}>
               <td style={{ ...td, fontSize: 12, color: C.muted }}>{String(c.received_at || c.ts || "").slice(0, 16).replace("T", " ")}</td>
               <td style={td}>{c.invoice || "—"}</td>
@@ -194,6 +237,7 @@ export default function KasaniGR() {
               <td style={td}>{Math.round(c.qty_base)} {BASE_UNIT[c.packmat]}{c.qty_entered && c.unit && Number(c.qty_entered) !== Number(c.qty_base) ? ` (${c.qty_entered} ${c.unit})` : ""}</td>
               <td style={td}>{c.location}</td>
               <td style={{ ...td, color: C.muted, fontSize: 13 }}>{c.supplier || "—"}</td>
+              <td style={td}><button onClick={() => startEdit(c)} style={{ ...ghost, padding: "4px 10px", fontSize: 13 }}>Edit</button></td>
             </tr>))}</tbody>
         </table>
       </div>

@@ -1,6 +1,7 @@
 import React, { useEffect, useMemo, useState } from "react";
 import * as XLSX from "xlsx";
 import { hasSupabase } from "./supabase";
+import { upsertLineMaterials, clearLineMaterials } from "./dataKasani";
 import {
   loadSkus, upsertSkus, updateSku, deleteAllSkus, loadConversion, upsertConversion,
   addLedger, addLedgerMany, loadLedger, computeOnHand, computeBlocked,
@@ -628,6 +629,8 @@ function Settings({ skus, msg, setMsg, refresh }) {
   const [edit, setEdit] = useState(null);
   const [add, setAdd] = useState(false);
   const [cmsg, setCmsg] = useState("");
+  const [lmsg, setLmsg] = useState("");
+  const [lmReplace, setLmReplace] = useState(true);
   const importSkus = (file) => readSheet(file, async (aoa) => {
     let hr = aoa.findIndex((r) => (r || []).some((x) => /sku\s*code|^sku$/i.test(String(x)))); if (hr < 0) hr = 0;
     const H = (aoa[hr] || []).map(norm); const find = (re) => H.findIndex((h) => re.test(h));
@@ -641,7 +644,19 @@ function Settings({ skus, msg, setMsg, refresh }) {
       rows.push({ code, description: String(row[iDesc] || ""), weight: w, primary_type: String(row[iPrim] || "").toLowerCase().includes("lam") ? "laminate" : "carton", outer_type: ot, primary_code: String(row[iPc] || ""), outer_code: String(row[iOc] || ""), divider: /divider|yes|required/.test(String(row[iAdd] || "").toLowerCase()) || (w >= 1000 && ot === "cld") });
     }
     if (!rows.length) { setMsg("No SKU rows found — check headers."); return; }
-    const { error } = await upsertSkus(rows); setMsg(error ? `Error: ${error.message || error}` : `Imported ${rows.length} SKUs.`); refresh();
+    // A code appearing twice in the sheet would break the upsert, so collapse them here
+    // (last row wins) and say which ones repeated so the sheet can be corrected.
+    const seen = new Map();
+    const dupes = [];
+    rows.forEach((r) => { if (seen.has(r.code)) dupes.push(r.code); seen.set(r.code, r); });
+    const clean = [...seen.values()];
+    const { error } = await upsertSkus(clean);
+    if (error) { setMsg(`Error: ${error.message || error}`); return; }
+    const uniq = [...new Set(dupes)];
+    setMsg(uniq.length
+      ? `Imported ${clean.length} SKUs. ${uniq.length} code(s) appeared more than once in the sheet — the last row of each was kept: ${uniq.slice(0, 8).join(", ")}${uniq.length > 8 ? ` +${uniq.length - 8} more` : ""}.`
+      : `Imported ${clean.length} SKUs.`);
+    refresh();
   });
 
   // conversion CSV: weight, cartons_per_t, pouch_per_t, lam_per_t, cld_per_t, sac_per_t, inner_per_t
@@ -666,7 +681,47 @@ function Settings({ skus, msg, setMsg, refresh }) {
     setCmsg(error ? `Error: ${error.message || error}` : `Upserted ${rows.length} conversion row(s).`); refresh();
   });
 
+  // line -> material code sheet (two columns: line, code). Drives what each machine
+  // sees on the BCE screen. Codes are matched against SKU primary_code / outer_code.
+  const importLineMap = (file) => readSheet(file, async (aoa) => {
+    let hr = aoa.findIndex((r) => (r || []).some((x) => /line|machine/i.test(String(x))));
+    if (hr < 0) hr = 0;
+    const H = (aoa[hr] || []).map(norm);
+    let iL = H.findIndex((h) => /line|machine/.test(h));
+    let iC = H.findIndex((h) => /code|material|packmat/.test(h));
+    // a sheet with no header row at all: assume col 0 = line, col 1 = code
+    if (iL < 0 && iC < 0) { iL = 0; iC = 1; hr = -1; }
+    const rows = [];
+    for (let r = hr + 1; r < aoa.length; r++) {
+      const row = aoa[r] || [];
+      const line = String(row[iL] || "").trim().toUpperCase();
+      const code = String(row[iC] || "").trim();
+      if (!line || !code) continue;
+      rows.push({ line, packmat_code: code });
+    }
+    if (!rows.length) { setLmsg("No rows found — expected two columns: line, material code."); return; }
+    if (lmReplace) await clearLineMaterials();
+    const { error } = await upsertLineMaterials(rows);
+    const lines = [...new Set(rows.map((r) => r.line))];
+    setLmsg(error ? `Error: ${error.message || error}` : `Loaded ${rows.length} code(s) across ${lines.length} line(s): ${lines.slice(0, 10).join(", ")}${lines.length > 10 ? "…" : ""}`);
+  });
+
   return (<div>
+    <div style={card}>
+      <b>Import line / material map</b>
+      <div style={{ fontSize: 13, color: C.muted, margin: "6px 0" }}>
+        Two columns: <b>line</b> (K1A, BOSCH, M8 …) and <b>material code</b>. One row per code — the same line repeats.
+        This is what each machine sees on the BCE call screen; without it, BCE falls back to the pack type and weight
+        set for that line in <code>lines_map</code>.
+      </div>
+      <div style={{ display: "flex", gap: 12, alignItems: "center", flexWrap: "wrap" }}>
+        <input type="file" accept=".xlsx,.xls,.csv" onChange={(e) => e.target.files[0] && importLineMap(e.target.files[0])} />
+        <label style={{ fontSize: 13, color: C.muted }}>
+          <input type="checkbox" checked={lmReplace} onChange={(e) => setLmReplace(e.target.checked)} /> replace the whole map
+        </label>
+      </div>
+      {lmsg && <div style={{ fontSize: 13, marginTop: 8, color: /error|No rows/i.test(lmsg) ? C.red : C.green }}>{lmsg}</div>}
+    </div>
     <div style={card}>
       <b>Import SKU master</b>
       <div style={{ fontSize: 13, color: C.muted, margin: "6px 0" }}>Columns: SKU Code, Description, Type (Outer), Type (Primary), Weight, Primary Code, Outer Code, Additional Requirement.</div>
@@ -775,7 +830,7 @@ function ActionModal({ modal, skus, onHand, onClose, onSave }) {
     if (!sku || !packmat || !qb) return;
     onSave({
       sku_code: sku, packmat, direction: modal.type, qty_base: qb,
-      line: modal.type === "issue" ? line : "", shift,
+      line: ["issue", "return"].includes(modal.type) ? line : "", shift,   // returns record the line too, for return-rate analytics
       note: `${Number(qty)} ${unit}`,   // keep what was actually typed
     });
   };
@@ -792,8 +847,8 @@ function ActionModal({ modal, skus, onHand, onClose, onSave }) {
     </div>
     {f !== 1 && Number(qty) > 0 && <div style={{ fontSize: 12, color: C.slate, marginTop: 6 }}>= {qb} {baseUnit(packmat)}</div>}
     {sku && packmat && <div style={{ fontSize: 12, color: C.muted, marginTop: 6 }}>On-hand now: {Math.round(avail)} {UNIT[packmat]}</div>}
-    {modal.type === "issue" && <div style={{ display: "flex", gap: 8, marginTop: 8 }}>
-      <div style={{ flex: 1 }}><label style={{ fontSize: 12 }}>Machine / line</label><br /><input value={line} onChange={(e) => setLine(e.target.value)} placeholder="e.g. K9" style={{ ...inp, width: "100%" }} /></div>
+    {["issue", "return"].includes(modal.type) && <div style={{ display: "flex", gap: 8, marginTop: 8 }}>
+      <div style={{ flex: 1 }}><label style={{ fontSize: 12 }}>{modal.type === "return" ? "Returned by line" : "Machine / line"}</label><br /><input value={line} onChange={(e) => setLine(e.target.value)} placeholder="e.g. K9" style={{ ...inp, width: "100%" }} /></div>
       <div style={{ width: 90 }}><label style={{ fontSize: 12 }}>Shift</label><br /><select value={shift} onChange={(e) => setShift(e.target.value)} style={{ ...inp, width: "100%" }}>{SHIFTS.map((x) => <option key={x}>{x}</option>)}</select></div>
     </div>}
     <button onClick={submit} style={{ ...btn(C.slate), width: "100%", marginTop: 14 }}>Save</button>

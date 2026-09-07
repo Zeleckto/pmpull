@@ -36,3 +36,19 @@ Your `src/App.jsx` and `src/data.js` are untouched.
 - Phase-2 conversion uses the `conversion` table via `perT()` in shared.js (base units per tonne).
 - All new DB access is in `dataKasani.js`; keep that separation.
 - Screens are independent — deploy whichever are ready; a broken one doesn't block others.
+
+---
+
+## Phase 3 / 4 additions (run `sql/phase3.sql` then `sql/phase4.sql`)
+- **Kasani is now a 3-tile home screen** (`kasani/KasaniHome.jsx`): Goods Received / Stock Status /
+  Dispatch, plus a tucked-away Truck & unit settings link. `KasaniInventory.jsx` is superseded.
+- **`pack_config`** holds BOTH the entry-unit factors (1 big roll = 450 kg) and the truck
+  capacities (how many fill 100%). Edited in Kasani → Truck & unit settings. Persisted — set once.
+- **`consignments.qty_remaining`** makes FIFO work: one row per invoice, drawn down oldest-first
+  by dispatch, so the Stock screen's "pick from" location moves to the next invoice automatically.
+  There is deliberately NO separate packmat/invoice table — consignments already is one.
+- **Dispatch** reads `kasani_requests` (the PM store's shortfall), not a CSV. PILOT: it plans the
+  full requested amount even when Kasani is short, letting stock go negative, so sequencing can be
+  tested. Search `PILOT:` in `KasaniDispatch.jsx` to restore the clamp.
+- **`Leadership.jsx` is now `Commercial.jsx`** — ILT sign-off with expandable trucks showing the GR
+  paperwork behind them, a GR register for GRN No./date + SAP ticks, and the loss report. PIN 3333.
