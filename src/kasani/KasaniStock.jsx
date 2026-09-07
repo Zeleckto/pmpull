@@ -7,11 +7,11 @@
 import React, { useEffect, useState } from "react";
 import {
   loadConsignments, setConsignmentStatus, addConsignments, loadSkusK,
-  stockByMaterial, remainingOf,
+  stockByMaterial, remainingOf, clearOpeningStock, fillSkuGaps,
 } from "../dataKasani";
 import {
   LBL, BASE_UNIT, grStatus, compsOf, codeFor, findByCode,
-  C, btn, ghost, card, inp, th, td, readSheet, norm,
+  C, btn, ghost, card, inp, th, td, readSheet, norm, todayStr,
 } from "../shared";
 
 const COUNTS = [
@@ -34,6 +34,10 @@ export default function KasaniStock() {
   const [chosenInv, setChosenInv] = useState(null); // invoice picked inside that box
   const [up, setUp] = useState(null);             // parsed CSV awaiting confirmation
   const [asCleared, setAsCleared] = useState(true);
+  const [op, setOp] = useState(null);              // parsed opening-stock sheet
+  const [opDate, setOpDate] = useState(todayStr());
+  const [opReplace, setOpReplace] = useState(true);
+  const [opFillMaster, setOpFillMaster] = useState(true);
   const [busy, setBusy] = useState(false);
   const [msg, setMsg] = useState("");
 
@@ -149,6 +153,128 @@ export default function KasaniStock() {
     setUp(null); refresh();
   };
 
+  // ---------- opening stock, from the wide "qty in hand" sheet ----------
+  // One row carries BOTH packmats:
+  //   SKU Code | Description | Primary Type | Primary Packmat Code | Outer Type |
+  //   Outer Packmat Code | Qty in Hand - Primary | Qty in Hand - Outer
+  // so each row becomes up to two consignments. Cells holding 0, "-" or blank are
+  // treated as MISSING and the SKU master is used instead — never the other way round.
+  const canonPrimary = (t) => (String(t || "").toLowerCase().includes("lam") ? "laminate" : "carton");
+  const canonOuter = (t) => (/sac|wov/.test(String(t || "").toLowerCase()) ? "sac" : "cld");
+  const blankish = (v) => {
+    const t = String(v == null ? "" : v).trim();
+    return !t || t === "-" || t === "0" || t === "0.00";
+  };
+  const numOf = (v) => {
+    const t = String(v == null ? "" : v).replace(/,/g, "").trim();
+    if (!t || t === "-") return 0;
+    const n = Number(t.replace(/[^0-9.\-]/g, ""));
+    return Number.isFinite(n) && n > 0 ? n : 0;
+  };
+
+  const parseOpening = (file) => readSheet(file, (aoa) => {
+    let hr = aoa.findIndex((r) => (r || []).some((x) => /sku\s*code|cbu/i.test(String(x))));
+    if (hr < 0) hr = 0;
+    const H = (aoa[hr] || []).map(norm);
+    const at = (test) => H.findIndex(test);
+    const iSku = at((h) => /^sku\s*code$|^sku$|^cbu/.test(h)) >= 0 ? at((h) => /^sku\s*code$|^sku$|^cbu/.test(h)) : at((h) => /sku|cbu/.test(h));
+    const iDesc = at((h) => /descrip/.test(h));
+    const iQtyP = at((h) => /qty|hand/.test(h) && /primar/.test(h));
+    const iQtyO = at((h) => /qty|hand/.test(h) && /outer/.test(h));
+    const iCodeP = at((h) => /primar/.test(h) && /code/.test(h) && !/qty|hand/.test(h));
+    const iCodeO = at((h) => /outer/.test(h) && /code/.test(h) && !/qty|hand/.test(h));
+    const iTypeP = at((h) => /primar/.test(h) && /type/.test(h));
+    const iTypeO = at((h) => /outer/.test(h) && /type/.test(h));
+    if (iSku < 0 || (iQtyP < 0 && iQtyO < 0)) {
+      setMsg("Could not find the columns — expected SKU Code plus Qty in Hand - Primary / Qty in Hand - Outer.");
+      return;
+    }
+    const out = [];
+    for (let r = hr + 1; r < aoa.length; r++) {
+      const row = aoa[r] || [];
+      const code = String(row[iSku] || "").trim();
+      if (!code) continue;
+      const master = skus.find((x) => x.code === code);
+      const cell = (i) => (i >= 0 ? row[i] : "");
+
+      // sheet value if it is real, otherwise whatever the SKU master already knows
+      const pType = blankish(cell(iTypeP)) ? (master ? master.primary_type : "") : cell(iTypeP);
+      const oType = blankish(cell(iTypeO)) ? (master ? master.outer_type : "") : cell(iTypeO);
+      const pCode = blankish(cell(iCodeP)) ? (master ? master.primary_code : "") : String(cell(iCodeP)).trim();
+      const oCode = blankish(cell(iCodeO)) ? (master ? master.outer_code : "") : String(cell(iCodeO)).trim();
+
+      out.push({
+        sku_code: code,
+        desc: String(cell(iDesc) || "").trim() || (master ? master.description : ""),
+        known: !!master,
+        primary: pType ? { packmat: canonPrimary(pType), code: pCode || "", qty: numOf(cell(iQtyP)) } : null,
+        outer: oType ? { packmat: canonOuter(oType), code: oCode || "", qty: numOf(cell(iQtyO)) } : null,
+      });
+    }
+    const usable = out.filter((r) => (r.primary && r.primary.qty > 0) || (r.outer && r.outer.qty > 0));
+    setOp({ all: out, usable });
+    setMsg(usable.length ? "" : "Rows read, but every quantity was zero or blank.");
+  });
+
+  const opTotals = () => {
+    const t = {};
+    (op ? op.usable : []).forEach((r) => {
+      [r.primary, r.outer].forEach((x) => {
+        if (!x || x.qty <= 0) return;
+        t[x.packmat] = (t[x.packmat] || 0) + x.qty;
+      });
+    });
+    return t;
+  };
+
+  const commitOpening = async () => {
+    if (!op || !op.usable.length) return;
+    setBusy(true);
+    if (opReplace) {
+      const { error } = await clearOpeningStock();
+      if (error) { setBusy(false); setMsg(`Error clearing old opening stock: ${error.message || error}`); return; }
+    }
+    // fill only the BLANKS on the SKU master — an existing value is never touched
+    if (opFillMaster) {
+      const patch = [];
+      op.all.forEach((r) => {
+        const m = skus.find((x) => x.code === r.sku_code);
+        if (!m) return;
+        const next = { ...m };
+        let changed = false;
+        if (!String(m.primary_code || "").trim() && r.primary && r.primary.code) { next.primary_code = r.primary.code; changed = true; }
+        if (!String(m.outer_code || "").trim() && r.outer && r.outer.code) { next.outer_code = r.outer.code; changed = true; }
+        if (!String(m.primary_type || "").trim() && r.primary) { next.primary_type = r.primary.packmat; changed = true; }
+        if (!String(m.outer_type || "").trim() && r.outer) { next.outer_type = r.outer.packmat; changed = true; }
+        if (changed) patch.push(next);
+      });
+      if (patch.length) {
+        const { error } = await fillSkuGaps(patch);
+        if (error) { setBusy(false); setMsg(`Error updating the SKU master: ${error.message || error}`); return; }
+      }
+    }
+    const stamp = new Date(`${opDate}T06:00:00`).toISOString();
+    const rows = [];
+    op.usable.forEach((r) => {
+      [r.primary, r.outer].forEach((x) => {
+        if (!x || x.qty <= 0) return;
+        rows.push({
+          received_at: stamp, invoice: "OPENING", sku_code: r.sku_code, sku_desc: r.desc,
+          packmat: x.packmat, packmat_code: x.code || null,
+          qty_base: x.qty, qty_remaining: x.qty, qty_entered: x.qty, unit: BASE_UNIT[x.packmat],
+          location: "Kasani", floor: "Ground", supplier: null, source: "opening",
+          status: "cleared", cleared_at: stamp, sample_sent: false,
+          note: "opening stock load",
+        });
+      });
+    });
+    const { error } = await addConsignments(rows);
+    setBusy(false);
+    if (error) { setMsg(`Error: ${error.message || error}`); return; }
+    setMsg(`Opening stock loaded: ${rows.length} line(s) across ${op.usable.length} SKU(s), dated ${opDate}.`);
+    setOp(null); refresh();
+  };
+
   // ---------- views ----------
   const desc = (code) => (skus.find((s) => s.code === code) || {}).description || "";
   const withStatus = cons.map((c) => ({ ...c, st: grStatus(c) }));
@@ -184,6 +310,65 @@ export default function KasaniStock() {
     </div>
 
     {/* ---- CSV load ---- */}
+    {/* ---- opening stock: the wide "qty in hand" sheet ---- */}
+    <div style={{ ...card, borderLeft: `5px solid ${C.blue}` }}>
+      <b>Load opening stock (qty in hand sheet)</b>
+      <div style={{ fontSize: 13, color: C.muted, margin: "6px 0 10px" }}>
+        The wide layout: <b>SKU Code · Description · Primary Type · Primary Packmat Code · Outer Type · Outer Packmat Code ·
+        Qty in Hand - Primary · Qty in Hand - Outer</b>. Each row becomes up to two stock lines.
+        Cells holding <b>0</b>, <b>-</b> or blank are treated as missing and the SKU master is used instead — the sheet never overwrites it.
+        Quantities go in as they are: laminate in <b>kg</b>, carton / CLD / sac in <b>pcs</b>.
+      </div>
+      <div style={{ display: "flex", gap: 12, alignItems: "center", flexWrap: "wrap" }}>
+        <input type="file" accept=".xlsx,.xls,.csv" onChange={(e) => e.target.files[0] && parseOpening(e.target.files[0])} />
+        <label style={{ fontSize: 12, color: C.muted }}>Stock as at&nbsp;
+          <input type="date" value={opDate} onChange={(e) => setOpDate(e.target.value)} style={inp} /></label>
+        <label style={{ fontSize: 13, color: C.muted }}>
+          <input type="checkbox" checked={opReplace} onChange={(e) => setOpReplace(e.target.checked)} /> replace previous opening stock
+        </label>
+        <label style={{ fontSize: 13, color: C.muted }}>
+          <input type="checkbox" checked={opFillMaster} onChange={(e) => setOpFillMaster(e.target.checked)} /> fill blank codes on the SKU master
+        </label>
+      </div>
+
+      {op && <div style={{ marginTop: 12 }}>
+        <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", gap: 10, flexWrap: "wrap", marginBottom: 8 }}>
+          <div>
+            <b style={{ fontSize: 14 }}>Preview — {op.usable.length} SKU(s) with stock, {op.all.length - op.usable.length} with none</b>
+            <div style={{ fontSize: 12, color: C.muted, marginTop: 2 }}>
+              {Object.entries(opTotals()).map(([pm, v]) => `${LBL[pm]}: ${Math.round(v).toLocaleString()} ${BASE_UNIT[pm]}`).join("  ·  ") || "nothing"}
+              {op.all.some((r) => !r.known) ? ` · ${op.all.filter((r) => !r.known).length} not in the SKU master (still loads)` : ""}
+            </div>
+          </div>
+          <div style={{ display: "flex", gap: 8 }}>
+            <button onClick={() => { setOp(null); setMsg(""); }} style={ghost}>Cancel</button>
+            <button onClick={commitOpening} disabled={busy || !op.usable.length} style={btn(C.blue)}>
+              {busy ? "Loading…" : `Load ${op.usable.reduce((a, r) => a + ((r.primary && r.primary.qty > 0) ? 1 : 0) + ((r.outer && r.outer.qty > 0) ? 1 : 0), 0)} stock line(s)`}
+            </button>
+          </div>
+        </div>
+        <div style={{ maxHeight: 300, overflowY: "auto" }}>
+          <table style={{ width: "100%", borderCollapse: "collapse" }}>
+            <thead><tr>
+              <th style={th}>SKU</th><th style={th}>Description</th>
+              <th style={th}>Primary</th><th style={th}>Code</th><th style={th}>Qty</th>
+              <th style={th}>Outer</th><th style={th}>Code</th><th style={th}>Qty</th>
+            </tr></thead>
+            <tbody>{op.usable.map((r, i) => (<tr key={i}>
+              <td style={{ ...td, fontWeight: 600, color: r.known ? C.ink : C.amber }}>{r.sku_code}</td>
+              <td style={{ ...td, color: C.muted, fontSize: 13 }}>{(r.desc || "").slice(0, 26)}</td>
+              <td style={td}>{r.primary ? LBL[r.primary.packmat] : "—"}</td>
+              <td style={{ ...td, fontFamily: "monospace", fontSize: 12 }}>{(r.primary && r.primary.code) || "—"}</td>
+              <td style={{ ...td, fontWeight: 600 }}>{r.primary && r.primary.qty > 0 ? Math.round(r.primary.qty).toLocaleString() : "—"}</td>
+              <td style={td}>{r.outer ? LBL[r.outer.packmat] : "—"}</td>
+              <td style={{ ...td, fontFamily: "monospace", fontSize: 12 }}>{(r.outer && r.outer.code) || "—"}</td>
+              <td style={{ ...td, fontWeight: 600 }}>{r.outer && r.outer.qty > 0 ? Math.round(r.outer.qty).toLocaleString() : "—"}</td>
+            </tr>))}</tbody>
+          </table>
+        </div>
+      </div>}
+    </div>
+
     <div style={card}>
       <b>Load stock from a sheet</b>
       <div style={{ fontSize: 13, color: C.muted, margin: "6px 0 10px" }}>

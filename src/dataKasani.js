@@ -293,3 +293,21 @@ export async function replaceProduction(planDate, shift, rows) {
   if (error) console.error("replaceProduction insert", error);
   return { error };
 }
+
+// ---- opening stock (the one-off "what is on the floor today" load) ----
+// Marked source='opening' so it can be reloaded without touching real receipts.
+export async function clearOpeningStock() {
+  if (!hasSupabase) return { error: "no db" };
+  const { error } = await supabase.from("consignments").delete().eq("source", "opening");
+  if (error) console.error("clearOpeningStock", error);
+  return { error };
+}
+// Fill BLANK fields on the SKU master from a stock sheet. Never overwrites a value that
+// is already there — the master stays the authority, the sheet only plugs gaps.
+export async function fillSkuGaps(rows) {
+  if (!hasSupabase) return { error: "no db" };
+  if (!rows.length) return { error: null };
+  const { error } = await supabase.from("skus").upsert(rows, { onConflict: "code" });
+  if (error) console.error("fillSkuGaps", error);
+  return { error };
+}

@@ -136,3 +136,25 @@ export function fgCapable(s, onHand, conv) {
   }
   return { t: t === Infinity ? 0 : t, limit, per };
 }
+
+// ---- ISO week helpers, for the 19-week plan ----
+// ISO week 1 is the week containing 4 January; weeks start on Monday.
+export function isoWeekStart(year, week) {
+  const jan4 = new Date(Date.UTC(year, 0, 4));
+  const dow = (jan4.getUTCDay() + 6) % 7;                       // Mon = 0
+  const week1Mon = new Date(jan4.getTime() - dow * 86400000);
+  return new Date(week1Mon.getTime() + (week - 1) * 7 * 86400000);
+}
+// Reads the column headings planners actually use: "37.2026", "2026.37", "W37 2026", "2026-W37".
+export function parseWeekHeader(raw) {
+  const t = String(raw == null ? "" : raw).trim();
+  if (!t) return null;
+  let m = t.match(/^(\d{1,2})\s*[.\-\/]\s*(\d{4})$/);        // 37.2026
+  if (m) return { week: +m[1], year: +m[2] };
+  m = t.match(/^(\d{4})\s*[.\-\/]?\s*W?\s*(\d{1,2})$/i);    // 2026-W37 / 2026.37
+  if (m) return { week: +m[2], year: +m[1] };
+  m = t.match(/^W\s*(\d{1,2})\D+(\d{4})$/i);                  // W37 2026
+  if (m) return { week: +m[1], year: +m[2] };
+  return null;
+}
+export const SHELF_LIFE_DAYS = 180;   // packmat is treated as expiring 6 months after receipt

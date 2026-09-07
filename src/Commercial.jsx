@@ -14,7 +14,7 @@ import {
 import { loadLedger, loadAllRequests } from "./data";
 import { loadKasaniRequestsAll, loadPhasing, replacePhasing, replaceProduction } from "./dataKasani";
 import Analytics from "./Analytics";
-import { LBL, BASE_UNIT, grStatus, istToday, nextShifts, C, btn, ghost, card, inp, th, td, readSheet, exportXlsx, norm } from "./shared";
+import { LBL, BASE_UNIT, grStatus, istToday, nextShifts, isoWeekStart, parseWeekHeader, C, btn, ghost, card, inp, th, td, readSheet, exportXlsx, norm } from "./shared";
 
 export default function Commercial() {
   const [view, setView] = useState("ilt");
@@ -121,6 +121,43 @@ export default function Commercial() {
   });
 
   // Phasing. Daily = SKU + tonnes + shift, for one date. Weekly = SKU + tonnes, no shift.
+  // The 19-week plan, in the planners' own wide layout:
+  //   CBU Code | Description | 37.2026 | 38.2026 | ...
+  // Every week column becomes one row, dated to the Monday of that ISO week.
+  const uploadPlan = (file, unit) => readSheet(file, async (aoa) => {
+    let hr = aoa.findIndex((r) => (r || []).some((x) => /cbu|sku/i.test(String(x))));
+    if (hr < 0) hr = 0;
+    const head = aoa[hr] || [];
+    const iId = head.findIndex((h) => /cbu|sku/i.test(String(h)));
+    // any column whose heading reads like a week number
+    const weeks = [];
+    head.forEach((h, i) => {
+      const w = parseWeekHeader(h);
+      if (w) weeks.push({ i, ...w, label: String(h).trim(), date: isoWeekStart(w.year, w.week).toISOString().slice(0, 10) });
+    });
+    if (!weeks.length) { setUploadMsg("No week columns recognised — headings should read like 37.2026 or 2026-W37."); return; }
+
+    const div = unit === "kg" ? 1000 : 1;      // sheet is in kg unless told otherwise
+    const rows = [];
+    for (let r = hr + 1; r < aoa.length; r++) {
+      const row = aoa[r] || [];
+      const code = String(row[iId] || "").trim();
+      if (!code) continue;
+      weeks.forEach((w) => {
+        const v = Number(String(row[w.i] == null ? "" : row[w.i]).replace(/[^0-9.\-]/g, "")) || 0;
+        if (v <= 0) return;                    // a zero week is simply no demand
+        rows.push({ plan_date: w.date, week_label: w.label, sku_code: code, tonnes: v / div, horizon: "plan", shift: null });
+      });
+    }
+    if (!rows.length) { setUploadMsg("Week columns found, but every cell was blank or zero."); return; }
+    const { error } = await replacePhasing(rows.map((r) => r.plan_date), rows, "plan");
+    const totT = rows.reduce((a, r) => a + r.tonnes, 0);
+    const skuN = new Set(rows.map((r) => r.sku_code)).size;
+    setUploadMsg(error ? `Error: ${error.message || error}`
+      : `Plan loaded: ${skuN} SKU(s) x ${weeks.length} week(s) (${weeks[0].label} to ${weeks[weeks.length - 1].label}) = ${Math.round(totT).toLocaleString()} t total. If that total looks wrong by 1000x, switch the unit and re-upload.`);
+    if (!error) refresh();
+  });
+
   const uploadPhasing = (file, planDate, horizon) => readSheet(file, async (aoa) => {
     let hr = aoa.findIndex((r) => (r || []).some((x) => /sku|cbu|code/i.test(String(x))));
     if (hr < 0) hr = 0;
@@ -475,6 +512,6 @@ export default function Commercial() {
     {/* ---------------- Analytics ---------------- */}
     {view === "an" && <Analytics ledger={ledger} cons={cons} disp={disp} reqs={kreqs} skus={skus} conv={conv}
       production={prod} phasing={phasing} days={days} setDays={setDays}
-      onUploadProduction={uploadProduction} onUploadPhasing={uploadPhasing} uploadMsg={uploadMsg} />}
+      onUploadProduction={uploadProduction} onUploadPhasing={uploadPhasing} onUploadPlan={uploadPlan} uploadMsg={uploadMsg} />}
   </div>);
 }
