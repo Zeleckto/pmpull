@@ -1,4 +1,4 @@
-// BCE call screen. Built for someone standing at a machine with one hand free.
+// PAT Line call screen. Built for a phone held one-handed at the machine.
 //
 // Step 1: type the machine name (k1a, K1A, whatever) or tap it from the grid.
 // Step 2: only the SKUs that machine actually runs, then packmat, qty, Call.
@@ -15,7 +15,7 @@ const norm = (x) => String(x || "").trim().toUpperCase().replace(/[\s\-_.]/g, ""
 const canonPrimary = (t) => (String(t || "").toLowerCase().includes("lam") ? "laminate" : "carton");
 const canonOuter = (t) => (/sac|wov/.test(String(t || "").toLowerCase()) ? "sac" : "cld");
 
-export default function BCECall({ presetLine }) {
+export default function BCECall({ presetLine, onExit }) {
   const [skus, setSkus] = useState([]);
   const [lmap, setLmap] = useState([]);
   const [lmat, setLmat] = useState([]);
@@ -114,13 +114,32 @@ export default function BCECall({ presetLine }) {
     setTimeout(() => setDone(""), 4000);
   };
 
-  const big = { fontSize: 18, padding: 14, width: "100%", borderRadius: 10, border: `1px solid ${C.line}`, marginTop: 6, boxSizing: "border-box" };
+  // 16px minimum on every input: anything smaller makes iOS Safari zoom the page in.
+  const big = { fontSize: 17, padding: 14, width: "100%", borderRadius: 10, border: `1px solid ${C.line}`, marginTop: 6, boxSizing: "border-box" };
   const lbl = { fontSize: 14, fontWeight: 700, color: C.muted, marginTop: 16, display: "block" };
-  const wrap = { maxWidth: 520, margin: "0 auto", padding: 18, fontFamily: "system-ui,Arial", color: C.ink };
+  const wrap = {
+    maxWidth: 560, margin: "0 auto", padding: "16px 14px 96px",
+    fontFamily: "system-ui,Arial", color: C.ink, WebkitTextSizeAdjust: "100%",
+  };
+  const Styles = () => (<style>{`
+    .pat * { box-sizing: border-box; }
+    .pat button, .pat select, .pat input { font-family: inherit; min-height: 44px; }
+    .pat input, .pat select { font-size: 16px; }
+    .pat .machines { display: grid; grid-template-columns: repeat(auto-fill, minmax(92px, 1fr)); gap: 8px; }
+    .pat .footer { position: sticky; bottom: 0; padding: 12px 0 max(12px, env(safe-area-inset-bottom));
+                   background: linear-gradient(to top, #f1f5f9 72%, rgba(241,245,249,0)); }
+    @media (max-width: 420px) {
+      .pat .machines { grid-template-columns: repeat(auto-fill, minmax(78px, 1fr)); }
+      .pat h2 { font-size: 21px; }
+    }
+  `}</style>);
 
   // ---------------- step 1: which machine ----------------
-  if (!line) return (<div style={wrap}>
-    <h2 style={{ color: C.slate, marginBottom: 4 }}>Which machine?</h2>
+  if (!line) return (<div className="pat" style={wrap}><Styles />
+    <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", gap: 10 }}>
+      <h2 style={{ color: C.slate, margin: "0 0 4px" }}>Which machine?</h2>
+      {onExit && <button onClick={onExit} style={{ background: "transparent", border: 0, color: C.muted, fontSize: 13, cursor: "pointer", textDecoration: "underline" }}>exit</button>}
+    </div>
     <div style={{ fontSize: 14, color: C.muted, marginBottom: 14 }}>Type the machine name or tap it below. Capitals don&apos;t matter.</div>
     <input autoFocus value={typed} onChange={(e) => setTyped(e.target.value)} onKeyDown={(e) => e.key === "Enter" && submitTyped()}
       placeholder="e.g. k1a" style={{ ...big, fontSize: 26, padding: 18, textAlign: "center", textTransform: "uppercase", fontWeight: 700 }} />
@@ -129,7 +148,7 @@ export default function BCECall({ presetLine }) {
 
     {groups.map((g) => (<div key={g} style={{ marginTop: 18 }}>
       <div style={{ fontSize: 12, fontWeight: 700, color: C.muted, marginBottom: 6 }}>{g === "EXTERNAL" ? "OTHER SITES" : g}</div>
-      <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fill, minmax(96px, 1fr))", gap: 8 }}>
+      <div className="machines">
         {machines.filter((m) => (m.group_name || "MACHINES") === g).map((m) => (
           <button key={m.line} onClick={() => pickLine(m.line)} style={{
             padding: "16px 6px", fontSize: 19, fontWeight: 700, borderRadius: 10, cursor: "pointer",
@@ -148,8 +167,8 @@ export default function BCECall({ presetLine }) {
       + (cfg.weights ? ` · ${cfg.weights} g` : "")
     : "";
 
-  return (<div style={wrap}>
-    <div style={{ display: "flex", justifyContent: "space-between", alignItems: "flex-start", gap: 10 }}>
+  return (<div className="pat" style={wrap}><Styles />
+    <div style={{ display: "flex", justifyContent: "space-between", alignItems: "flex-start", gap: 10, flexWrap: "wrap" }}>
       <div>
         <h2 style={{ color: C.slate, margin: 0 }}>{cfg ? cfg.label || line : line}</h2>
         <div style={{ fontSize: 13, color: C.muted }}>{capability || "all materials"}{codesForLine.size ? ` · ${codesForLine.size} mapped codes` : ""}</div>
@@ -215,11 +234,14 @@ export default function BCECall({ presetLine }) {
         </div>);
       })}
 
-      <button onClick={call} disabled={busy || !wanted.length} style={{
-        width: "100%", marginTop: 22, padding: 20, fontSize: 22, fontWeight: 700, borderRadius: 12, border: 0,
-        cursor: wanted.length ? "pointer" : "not-allowed",
-        background: wanted.length ? C.slate : "#94a3b8", color: "#fff",
-      }}>{busy ? "Sending…" : wanted.length > 1 ? `Call ${wanted.length} items` : "Call packaging"}</button>
+      <div className="footer">
+        <button onClick={call} disabled={busy || !wanted.length} style={{
+          width: "100%", padding: 18, fontSize: 21, fontWeight: 700, borderRadius: 12, border: 0,
+          cursor: wanted.length ? "pointer" : "not-allowed",
+          background: wanted.length ? C.slate : "#94a3b8", color: "#fff",
+          boxShadow: wanted.length ? "0 4px 14px rgba(31,58,95,.28)" : "none",
+        }}>{busy ? "Sending…" : wanted.length > 1 ? `Call ${wanted.length} items` : "Call packaging"}</button>
+      </div>
     </>}
 
     {done && <div style={{ marginTop: 14, padding: 14, background: done.startsWith("✓") ? "#eafaf0" : "#fef2f2", color: done.startsWith("✓") ? C.green : C.red, borderRadius: 10, textAlign: "center", fontWeight: 600 }}>{done}</div>}

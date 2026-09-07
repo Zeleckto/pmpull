@@ -118,6 +118,23 @@ export async function closeRequest(id) {
   const { error } = await supabase.from("requests").update({ status: "done" }).eq("id", id);
   if (error) console.error("closeRequest", error);
 }
+// Close a request recording what was ACTUALLY issued. The ask stays in qty_base, so the
+// difference between asked and given survives and can be reported on.
+export async function fulfilRequest(id, qty_issued, note) {
+  if (!hasSupabase) return { error: "no db" };
+  const { error } = await supabase.from("requests")
+    .update({ status: "done", qty_issued, issued_at: new Date().toISOString(), issue_note: note || null })
+    .eq("id", id);
+  if (error) console.error("fulfilRequest", error);
+  return { error };
+}
+// every request, for the asked-vs-given report
+export async function loadAllRequests() {
+  if (!hasSupabase) return [];
+  const { data, error } = await supabase.from("requests").select("*").order("ts", { ascending: false }).limit(500);
+  if (error) { console.error("loadAllRequests", error); return []; }
+  return data || [];
+}
 
 // ---------- Conversion upload (Settings) ----------
 export async function upsertConversion(rows) {

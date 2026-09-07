@@ -1,23 +1,26 @@
-// Commercial (was "Leadership"). Two jobs beyond the analytics:
-//   1. ILT sign-off on trucks Kasani has dispatched — expand a truck to see every line
-//      AND the goods-received rows behind them, which is what gets keyed into SAP.
-//   2. The GR register: fill in GRN No. / GRN date, tick off SAP entry, export to Excel.
-import React, { useEffect, useState } from "react";
+// Commercial. ONE row of cards along the top; clicking one opens that thing underneath
+// and nothing else. No second tab row, no nested drill-downs — the cards are the navigation.
+//   ILT & trucks      sign-off, expand a truck for its load and the GR behind it
+//   Goods received    the GR/SAP register: GRN no, GRN date, SAP ticks, export
+//   Quality pending   what Kasani is holding, urgent first, with sample status
+//   Blocked/rejected  material held at either site, with quantities
+//   Returned          what the lines sent back, and against what they were issued
+//   Analytics         loss, shortfall, logistics
+import React, { useEffect, useMemo, useState } from "react";
 import {
-  loadConsignments, loadProduction, addProduction, loadDispatches, setDispatch,
+  loadConsignments, loadProduction, loadDispatches, setDispatch,
   updateConsignment, kasaniOnHand, loadSkusK, loadConversionK, remainingOf,
 } from "./dataKasani";
-import { loadLedger } from "./data";
+import { loadLedger, loadAllRequests } from "./data";
 import { loadKasaniRequestsAll, loadPhasing, replacePhasing, replaceProduction } from "./dataKasani";
 import Analytics from "./Analytics";
-import { LBL, BASE_UNIT, compsOf, fgEquiv, theo, grStatus, istToday, C, btn, ghost, card, inp, th, td, readSheet, exportXlsx, norm } from "./shared";
+import { LBL, BASE_UNIT, grStatus, istToday, nextShifts, C, btn, ghost, card, inp, th, td, readSheet, exportXlsx, norm } from "./shared";
 
 export default function Commercial() {
-  const [tab, setTab] = useState("ilt");
+  const [view, setView] = useState("ilt");
   const [skus, setSkus] = useState([]); const [conv, setConv] = useState({});
   const [ledger, setLedger] = useState([]); const [prod, setProd] = useState([]);
   const [cons, setCons] = useState([]); const [disp, setDisp] = useState([]);
-  const [loss, setLoss] = useState(null);
   const [open, setOpen] = useState({});        // truck id -> expanded
   const [edit, setEdit] = useState({});        // consignment id -> {grn_no, grn_date}
   const [q, setQ] = useState("");
@@ -25,6 +28,7 @@ export default function Commercial() {
   const [kreqs, setKreqs] = useState([]);
   const [days, setDays] = useState(7);
   const [phasing, setPhasing] = useState([]);
+  const [allReqs, setAllReqs] = useState([]);
   const [uploadMsg, setUploadMsg] = useState("");
 
   const refresh = async () => {
@@ -33,6 +37,7 @@ export default function Commercial() {
     setCons(await loadConsignments()); setDisp(await loadDispatches());
     setKreqs(await loadKasaniRequestsAll());
     setPhasing(await loadPhasing());
+    setAllReqs(await loadAllRequests());
   };
   useEffect(() => { refresh(); }, []);
 
@@ -43,36 +48,6 @@ export default function Commercial() {
       const k = `${e.sku_code}|${e.packmat}`; issuedToday[k] = (issuedToday[k] || 0) + Number(e.qty_base);
     }
   });
-
-  // ---------- loss ----------
-  const runLoss = (file) => readSheet(file, async (aoa) => {
-    const H = (aoa[0] || []).map(norm);
-    const iId = H.findIndex((h) => /sku|cbu|code/.test(h));
-    const iT = H.findIndex((h) => /tonne|ton|fg|qty|produced|total/.test(h));
-    const prows = [];
-    for (let r = 1; r < aoa.length; r++) {
-      const row = aoa[r] || []; const code = String(row[iId] || "").trim();
-      const t = Number(String(row[iT] || "").replace(/[^0-9.]/g, "")) || 0;
-      if (code && t) prows.push({ plan_date: today, sku_code: code, tonnes: t });
-    }
-    if (prows.length) await addProduction(prows);
-    computeLoss(prows); refresh();
-  });
-  function computeLoss(prows) {
-    const cat = { carton: 0, cld: 0, sac: 0, laminate: 0 }; const detail = [];
-    prows.forEach((p) => {
-      const s = skus.find((x) => x.code === p.sku_code);
-      if (!s) { detail.push({ code: p.sku_code, flag: "not in master" }); return; }
-      compsOf(s).forEach((pm) => {
-        if (pm === "divider") return;
-        const th_ = theo(pm, s, p.tonnes, conv); const iss = issuedToday[`${p.sku_code}|${pm}`] || 0;
-        const varB = iss - th_;
-        if (cat[pm] != null) cat[pm] += fgEquiv(pm, varB, s, conv);
-        detail.push({ code: p.sku_code, pm, t: p.tonnes, th: Math.round(th_), iss: Math.round(iss), varB: Math.round(varB) });
-      });
-    });
-    setLoss({ cat, total: cat.carton + cat.cld + cat.sac + cat.laminate, detail });
-  }
 
   // ---------- ILT ----------
   // The GR rows behind a truck: same SKU+packmat, cleared, oldest first — that is the
@@ -174,23 +149,80 @@ export default function Commercial() {
     if (!error) refresh();
   });
 
-  const kOn = kasaniOnHand(cons);
-  const grPending = cons.filter((c) => c.status === "pending").length;
-  const iltPending = disp.filter((d) => !d.ilt_done).length;
-  const sapPending = cons.filter((c) => !c.sap_entered).length;
+  // ---------- what sits behind each headline number ----------
+  const want3 = nextShifts(3);
+  const needSoon = useMemo(() => {
+    const set = new Set();
+    phasing.forEach((p) => { if (want3.some((w) => w.date === p.plan_date && w.shift === p.shift)) set.add(p.sku_code); });
+    kreqs.forEach((r) => { if (r.status === "open") set.add(r.sku_code); });
+    return set;
+  }, [phasing, kreqs]);
+
+  const qualityPending = useMemo(() => cons
+    .filter((c) => c.status === "pending")
+    .map((c) => ({ ...c, urgent: needSoon.has(c.sku_code), waited: (Date.now() - new Date(c.received_at || c.ts)) / 3600000 }))
+    .sort((a, b) => (b.urgent - a.urgent) || b.waited - a.waited), [cons, needSoon]);
+
+  // Blocked material, wherever it is sitting: the PM store's ledger balance
+  // (block − released − scrapped) plus anything Kasani has rejected.
+  const blockedAll = useMemo(() => {
+    const m = {};
+    ledger.forEach((e) => {
+      const k = `${e.sku_code}|${e.packmat}`; const q = Number(e.qty_base) || 0;
+      if (e.direction === "block") m[k] = (m[k] || 0) + q;
+      else if (e.direction === "unblock" || e.direction === "scrap") m[k] = (m[k] || 0) - q;
+    });
+    const pm = Object.entries(m).filter(([, v]) => v > 0.5).map(([k, v]) => {
+      const [sku_code, packmat] = k.split("|");
+      return { where: "PM store", sku_code, packmat, qty: v, reason: "held at store" };
+    });
+    const ks = cons.filter((c) => c.status === "rejected").map((c) => ({
+      where: "Kasani", sku_code: c.sku_code, packmat: c.packmat, qty: Number(c.qty_base) || 0,
+      reason: c.reject_reason || "no reason given", invoice: c.invoice,
+    }));
+    return [...pm, ...ks].sort((a, b) => b.qty - a.qty);
+  }, [ledger, cons]);
+  const blockedQty = blockedAll.reduce((a, r) => a + r.qty, 0);
+
+  // What the lines sent back, and what they were issued, so the rate means something.
+  const returns = useMemo(() => {
+    const m = {};
+    ledger.forEach((e) => {
+      const ln = String(e.line || "").trim().toUpperCase();
+      if (!ln || !["issue", "return"].includes(e.direction)) return;
+      const k = `${ln}|${e.sku_code}|${e.packmat}`;
+      if (!m[k]) m[k] = { line: ln, sku_code: e.sku_code, packmat: e.packmat, issued: 0, returned: 0, last: null };
+      const q = Math.abs(Number(e.qty_base) || 0);
+      if (e.direction === "issue") m[k].issued += q;
+      else { m[k].returned += q; if (!m[k].last || e.ts > m[k].last) m[k].last = e.ts; }
+    });
+    return Object.values(m).filter((r) => r.returned > 0)
+      .map((r) => ({ ...r, rate: r.issued ? (r.returned / r.issued) * 100 : 100 }))
+      .sort((a, b) => b.returned - a.returned);
+  }, [ledger]);
+  const returnedQty = returns.reduce((a, r) => a + r.returned, 0);
+
+  const iltTrucks = disp.filter((d) => d.dispatched_at && !d.ilt_done);
+  const sapRows = cons.filter((c) => !c.sap_entered);
+
   const exportDay = () => {
     const rows = ledger.filter((e) => String(e.ts).slice(0, 10) === today)
       .map((e) => ({ time: e.ts, sku: e.sku_code, packmat: e.packmat, action: e.direction, qty: e.qty_base, line: e.line, shift: e.shift }));
     exportXlsx(`pmstore_${today}.xlsx`, rows.length ? rows : [{ note: "no movements today" }]);
   };
 
-  const Kpi = ({ label, val, color }) => (<div style={{ ...card, marginBottom: 0, minWidth: 150 }}>
-    <div style={{ fontSize: 12, color: C.muted }}>{label}</div>
-    <div style={{ fontSize: 24, fontWeight: 700, color: color || C.ink }}>{val}</div></div>);
-  const Tab = ({ id, children }) => (<button onClick={() => setTab(id)} style={{
-    padding: "9px 15px", borderRadius: 8, marginRight: 8, fontWeight: 600, cursor: "pointer",
-    border: `1px solid ${C.line}`, background: tab === id ? C.slate : "#fff", color: tab === id ? "#fff" : "#334155",
-  }}>{children}</button>);
+  const NavCard = ({ id, label, val, sub, color }) => (
+    <button onClick={() => setView(id)} style={{
+      ...card, marginBottom: 0, minWidth: 150, flex: "1 1 150px", textAlign: "left", cursor: "pointer", font: "inherit",
+      border: `1px solid ${view === id ? C.slate : C.line}`,
+      borderTop: `3px solid ${view === id ? C.slate : "transparent"}`,
+      background: view === id ? "#fff" : "#fbfcfe",
+      boxShadow: view === id ? "0 2px 10px rgba(15,23,42,.10)" : "none",
+    }}>
+      <div style={{ fontSize: 12, color: C.muted }}>{label}</div>
+      <div style={{ fontSize: 23, fontWeight: 700, color: color || C.ink }}>{val}</div>
+      <div style={{ fontSize: 11, color: C.muted, marginTop: 2 }}>{sub}</div>
+    </button>);
 
   const grRows = cons.filter((c) => !q || `${c.invoice} ${c.grn_no} ${c.po_no} ${c.sku_code} ${c.packmat_code} ${c.supplier}`.toLowerCase().includes(q.toLowerCase()));
 
@@ -203,29 +235,33 @@ export default function Commercial() {
       </div>
     </div>
 
-    <div style={{ display: "flex", gap: 12, flexWrap: "wrap", margin: "16px 0" }}>
-      <Kpi label="ILT pending" val={iltPending} color={iltPending ? C.red : C.green} />
-      <Kpi label="Not yet in SAP" val={sapPending} color={sapPending ? C.amber : C.green} />
-      <Kpi label="GR quality pending" val={grPending} color={grPending ? C.amber : C.green} />
-      <Kpi label="Kasani stock lines" val={Object.keys(kOn).length} />
-      <Kpi label="SKUs" val={skus.length} />
-    </div>
-
-    <div style={{ marginBottom: 16 }}>
-      <Tab id="ilt">ILT &amp; trucks</Tab><Tab id="gr">GR register (SAP)</Tab><Tab id="analytics">Analytics</Tab><Tab id="loss">Packmat loss</Tab>
+    {/* ---------------- the only navigation ---------------- */}
+    <div style={{ display: "flex", gap: 10, flexWrap: "wrap", margin: "16px 0" }}>
+      <NavCard id="ilt" label="ILT &amp; trucks" val={iltTrucks.length}
+        sub={iltTrucks.length ? "awaiting sign-off" : "all signed off"} color={iltTrucks.length ? C.red : C.green} />
+      <NavCard id="gr" label="Goods received" val={cons.length}
+        sub={sapRows.length ? `${sapRows.length} not in SAP` : "all in SAP"} color={sapRows.length ? C.amber : C.green} />
+      <NavCard id="qp" label="Quality pending" val={qualityPending.length}
+        sub={qualityPending.filter((c) => c.urgent).length ? `${qualityPending.filter((c) => c.urgent).length} needed in next 3 shifts` : "at Kasani"}
+        color={qualityPending.some((c) => c.urgent) ? C.red : qualityPending.length ? C.amber : C.green} />
+      <NavCard id="blk" label="Blocked / rejected" val={Math.round(blockedQty).toLocaleString()}
+        sub={`units · ${blockedAll.length} line(s)`} color={blockedQty ? C.red : C.green} />
+      <NavCard id="ret" label="Returned from lines" val={Math.round(returnedQty).toLocaleString()}
+        sub={`units · ${returns.length} line/SKU`} color={returnedQty ? C.amber : C.green} />
+      <NavCard id="an" label="Analytics" val="›" sub="loss, shortfall, logistics" color={C.slate} />
     </div>
     {msg && <div style={{ fontSize: 13, marginBottom: 12, padding: "8px 10px", borderRadius: 8, background: /error/i.test(msg) ? "#fef2f2" : "#f0fdf4", color: /error/i.test(msg) ? C.red : C.green }}>{msg}</div>}
 
-    {/* ---------------- ILT ---------------- */}
-    {tab === "ilt" && <div style={card}>
+    {/* ---------------- ILT & trucks ---------------- */}
+    {view === "ilt" && <div style={card}>
       <b>Trucks from Kasani ({disp.length})</b>
       <div style={{ fontSize: 13, color: C.muted, margin: "4px 0 12px" }}>
-        Expand a truck to see its load and the goods-received paperwork behind it — invoice, PO, GRN, supplier and location, ready to key into SAP.
+        Expand a truck to see its load and the goods-received paperwork behind it.
       </div>
       {disp.length === 0 ? <div style={{ color: C.muted, padding: 8 }}>No trucks yet.</div> :
         disp.map((d) => {
           const gr = open[d.id] ? grBehind(d.lines) : [];
-          return (<div key={d.id} style={{ border: `1px solid ${C.line}`, borderLeft: `5px solid ${d.ilt_done ? C.green : C.amber}`, borderRadius: 10, padding: 12, marginBottom: 10 }}>
+          return (<div key={d.id} style={{ border: `1px solid ${C.line}`, borderLeft: `5px solid ${d.ilt_done ? C.green : d.challan ? C.amber : C.line}`, borderRadius: 10, padding: 12, marginBottom: 8 }}>
             <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", gap: 10, flexWrap: "wrap" }}>
               <div>
                 <b>Truck #{d.truck_no}</b>
@@ -248,16 +284,16 @@ export default function Commercial() {
             {open[d.id] && <div style={{ marginTop: 12 }}>
               <div style={{ fontSize: 12, fontWeight: 700, color: C.muted, marginBottom: 4 }}>TRUCK LOAD</div>
               <table style={{ width: "100%", borderCollapse: "collapse", marginBottom: 14 }}>
-                <thead><tr><th style={th}>SKU</th><th style={th}>Packmat</th><th style={th}>Material code</th><th style={th}>Qty</th><th style={th}>Shift</th></tr></thead>
-                <tbody>{(d.lines || []).map((l, i) => (<tr key={i}>
+                <thead><tr><th style={th}>SKU</th><th style={th}>Description</th><th style={th}>Packmat</th><th style={th}>Material code</th><th style={th}>Qty</th><th style={th}>Shift</th></tr></thead>
+                <tbody>{(d.lines || []).map((l, i2) => (<tr key={i2}>
                   <td style={{ ...td, fontWeight: 600 }}>{l.sku_code}</td>
+                  <td style={{ ...td, color: C.muted, fontSize: 13 }}>{(l.sku_desc || (skus.find((x) => x.code === l.sku_code) || {}).description || "").slice(0, 26)}</td>
                   <td style={td}>{LBL[l.packmat] || l.packmat}</td>
                   <td style={{ ...td, fontFamily: "monospace", fontSize: 12 }}>{l.packmat_code || "—"}</td>
                   <td style={td}>{Math.round(l.qty_base)} {BASE_UNIT[l.packmat]}</td>
                   <td style={td}>{l.shift}</td>
                 </tr>))}</tbody>
               </table>
-
               <div style={{ fontSize: 12, fontWeight: 700, color: C.muted, marginBottom: 4 }}>GOODS RECEIVED BEHIND THIS LOAD — for SAP</div>
               {gr.length === 0 ? <div style={{ fontSize: 13, color: C.muted, padding: 6 }}>No matching cleared receipts found.</div> :
                 <div style={{ overflowX: "auto" }}>
@@ -286,15 +322,15 @@ export default function Commercial() {
     </div>}
 
     {/* ---------------- GR register ---------------- */}
-    {tab === "gr" && <div style={card}>
+    {view === "gr" && <div style={card}>
       <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", gap: 10, flexWrap: "wrap", marginBottom: 10 }}>
         <b>Goods received register ({grRows.length})</b>
         <input placeholder="search invoice / GRN / PO / SKU / code / supplier" value={q} onChange={(e) => setQ(e.target.value)} style={{ ...inp, width: 340 }} />
       </div>
       <div style={{ fontSize: 13, color: C.muted, marginBottom: 10 }}>
-        The warehouse leaves GRN blank. Fill it here, tick <b>SAP</b> once it is keyed in, and export the register when you need the whole day at once.
+        The warehouse leaves GRN blank. Fill it here, tick <b>SAP</b> once it is keyed in, and export the register for the whole day.
       </div>
-      <div style={{ maxHeight: 520, overflowY: "auto", overflowX: "auto" }}>
+      <div style={{ maxHeight: 560, overflowY: "auto", overflowX: "auto" }}>
         <table style={{ width: "100%", borderCollapse: "collapse", minWidth: 980 }}>
           <thead><tr>
             <th style={th}>Received</th><th style={th}>Invoice</th><th style={th}>PO</th><th style={th}>Supplier</th>
@@ -327,28 +363,118 @@ export default function Commercial() {
       </div>
     </div>}
 
-    {tab === "analytics" && <Analytics ledger={ledger} cons={cons} disp={disp} reqs={kreqs} skus={skus} conv={conv}
+    {/* ---------------- Quality pending ---------------- */}
+    {view === "qp" && <div style={card}>
+      <b>Quality pending at Kasani ({qualityPending.length})</b>
+      <div style={{ fontSize: 13, color: C.muted, margin: "4px 0 10px" }}>
+        <b>Needed soon</b> = the SKU is in the phasing for {want3.map((w) => `${w.date} ${w.shift}`).join(", ")}, or the store has an open request for it. Sample those first.
+      </div>
+      {qualityPending.length === 0 ? <div style={{ color: C.muted, padding: 8 }}>Nothing awaiting quality.</div> :
+        <div style={{ maxHeight: 520, overflowY: "auto" }}>
+          <table style={{ width: "100%", borderCollapse: "collapse" }}>
+            <thead><tr><th style={th}>Priority</th><th style={th}>SKU</th><th style={th}>Packmat</th><th style={th}>Code</th><th style={th}>Qty</th><th style={th}>Invoice</th><th style={th}>Waiting</th><th style={th}>Sample</th></tr></thead>
+            <tbody>{qualityPending.map((c) => (<tr key={c.id} style={{ background: c.urgent ? "#fff7ed" : "transparent" }}>
+              <td style={td}>{c.urgent
+                ? <span style={{ background: C.red, color: "#fff", borderRadius: 10, padding: "1px 8px", fontSize: 11, fontWeight: 700 }}>NEEDED SOON</span>
+                : <span style={{ fontSize: 12, color: C.muted }}>routine</span>}</td>
+              <td style={{ ...td, fontWeight: 600 }}>{c.sku_code || "—"}</td>
+              <td style={td}>{LBL[c.packmat] || c.packmat}</td>
+              <td style={{ ...td, fontFamily: "monospace", fontSize: 12 }}>{c.packmat_code || "—"}</td>
+              <td style={td}>{Math.round(c.qty_base)} {BASE_UNIT[c.packmat]}</td>
+              <td style={td}>{c.invoice || "—"}</td>
+              <td style={{ ...td, fontWeight: 600, color: c.waited > 48 ? C.red : c.waited > 24 ? C.amber : C.ink }}>
+                {c.waited < 24 ? `${c.waited.toFixed(1)} h` : `${(c.waited / 24).toFixed(1)} d`}</td>
+              <td style={td}>{c.sample_sent
+                ? <span style={{ color: C.amber, fontWeight: 700, fontSize: 13 }}>sent</span>
+                : <span style={{ color: C.red, fontWeight: 700, fontSize: 13 }}>NOT sent</span>}</td>
+            </tr>))}</tbody>
+          </table>
+        </div>}
+    </div>}
+
+    {/* ---------------- Blocked / rejected ---------------- */}
+    {view === "blk" && <div style={card}>
+      <b>Blocked / rejected material</b>
+      <div style={{ fontSize: 13, color: C.muted, margin: "4px 0 10px" }}>
+        Held at the PM store (blocked − released − scrapped) or rejected at Kasani. Quantities, not SKU counts.
+      </div>
+      {blockedAll.length === 0 ? <div style={{ color: C.muted, padding: 8 }}>Nothing blocked at either site.</div> :
+        <table style={{ width: "100%", borderCollapse: "collapse" }}>
+          <thead><tr><th style={th}>Where</th><th style={th}>SKU</th><th style={th}>Description</th><th style={th}>Packmat</th><th style={th}>Qty held</th><th style={th}>Invoice</th><th style={th}>Reason</th></tr></thead>
+          <tbody>{blockedAll.map((r, i2) => (<tr key={i2}>
+            <td style={td}><span style={{ background: r.where === "Kasani" ? "#7f1d1d" : C.red, color: "#fff", borderRadius: 10, padding: "1px 8px", fontSize: 11, fontWeight: 700 }}>{r.where}</span></td>
+            <td style={{ ...td, fontWeight: 600 }}>{r.sku_code || "—"}</td>
+            <td style={{ ...td, color: C.muted, fontSize: 13 }}>{((skus.find((x) => x.code === r.sku_code) || {}).description || "").slice(0, 24)}</td>
+            <td style={td}>{LBL[r.packmat] || r.packmat}</td>
+            <td style={{ ...td, fontWeight: 700, color: C.red }}>{Math.round(r.qty).toLocaleString()} {BASE_UNIT[r.packmat]}</td>
+            <td style={td}>{r.invoice || "—"}</td>
+            <td style={{ ...td, fontSize: 13, color: C.muted }}>{r.reason}</td>
+          </tr>))}</tbody>
+        </table>}
+    </div>}
+
+    {/* ---------------- Returned from lines ---------------- */}
+    {view === "ret" && <div style={card}>
+      <b>Returned from lines ({returns.length})</b>
+      <div style={{ fontSize: 13, color: C.muted, margin: "4px 0 10px" }}>
+        What came back, against what that line was issued of the same material. A high rate means over-drawing or a problem at the machine.
+      </div>
+      {returns.length === 0 ? <div style={{ color: C.muted, padding: 8 }}>Nothing returned. Returns only appear here when the line is recorded on the return.</div> :
+        <div style={{ maxHeight: 520, overflowY: "auto" }}>
+          <table style={{ width: "100%", borderCollapse: "collapse" }}>
+            <thead><tr><th style={th}>Line</th><th style={th}>SKU</th><th style={th}>Description</th><th style={th}>Packmat</th><th style={th}>Issued</th><th style={th}>Returned</th><th style={th}>Rate</th><th style={th}>Last return</th></tr></thead>
+            <tbody>{returns.map((r, i2) => (<tr key={i2}>
+              <td style={{ ...td, fontWeight: 700 }}>{r.line}</td>
+              <td style={{ ...td, fontWeight: 600 }}>{r.sku_code}</td>
+              <td style={{ ...td, color: C.muted, fontSize: 13 }}>{((skus.find((x) => x.code === r.sku_code) || {}).description || "").slice(0, 22)}</td>
+              <td style={td}>{LBL[r.packmat] || r.packmat}</td>
+              <td style={td}>{Math.round(r.issued).toLocaleString()}</td>
+              <td style={{ ...td, fontWeight: 600, color: C.amber }}>{Math.round(r.returned).toLocaleString()} {BASE_UNIT[r.packmat]}</td>
+              <td style={{ ...td, fontWeight: 700, color: r.rate > 15 ? C.red : r.rate > 5 ? C.amber : C.green }}>{r.rate.toFixed(1)}%</td>
+              <td style={{ ...td, fontSize: 12, color: C.muted }}>{String(r.last || "").slice(0, 16).replace("T", " ")}</td>
+            </tr>))}</tbody>
+          </table>
+        </div>}
+    </div>}
+
+    {/* asked vs given lives with returns: both are about issue accuracy */}
+    {view === "ret" && (() => {
+      const done = allReqs.filter((r) => r.qty_issued != null);
+      const short = done.filter((r) => Number(r.qty_issued) < Number(r.qty_base));
+      const over = done.filter((r) => Number(r.qty_issued) > Number(r.qty_base));
+      return (<div style={card}>
+        <b>Asked vs given ({done.length})</b>
+        <div style={{ fontSize: 13, color: C.muted, margin: "4px 0 10px" }}>
+          What the line called for against what the store actually issued.
+          {done.length ? ` ${short.length} short, ${over.length} over, ${done.length - short.length - over.length} exact.` : ""}
+        </div>
+        {done.length === 0 ? <div style={{ color: C.muted, padding: 8 }}>
+          Nothing yet. This fills up as the store issues against requests using <b>Issue…</b> on the PM Requests tab.
+        </div> :
+          <div style={{ maxHeight: 420, overflowY: "auto" }}>
+            <table style={{ width: "100%", borderCollapse: "collapse" }}>
+              <thead><tr><th style={th}>Issued at</th><th style={th}>Line</th><th style={th}>SKU</th><th style={th}>Packmat</th><th style={th}>Asked</th><th style={th}>Given</th><th style={th}>Difference</th></tr></thead>
+              <tbody>{done.slice(0, 200).map((r) => {
+                const d = Number(r.qty_issued) - Number(r.qty_base);
+                return (<tr key={r.id}>
+                  <td style={{ ...td, fontSize: 12 }}>{String(r.issued_at || "").slice(0, 16).replace("T", " ")}</td>
+                  <td style={{ ...td, fontWeight: 700 }}>{r.line || "—"}</td>
+                  <td style={{ ...td, fontWeight: 600 }}>{r.sku_code}</td>
+                  <td style={td}>{LBL[r.packmat] || r.packmat}</td>
+                  <td style={td}>{Math.round(r.qty_base)}</td>
+                  <td style={{ ...td, fontWeight: 600 }}>{Math.round(r.qty_issued)} {BASE_UNIT[r.packmat]}</td>
+                  <td style={{ ...td, fontWeight: 700, color: d === 0 ? C.green : d < 0 ? C.amber : C.blue }}>
+                    {d === 0 ? "exact" : d > 0 ? `+${Math.round(d)}` : Math.round(d)}</td>
+                </tr>);
+              })}</tbody>
+            </table>
+          </div>}
+      </div>);
+    })()}
+
+    {/* ---------------- Analytics ---------------- */}
+    {view === "an" && <Analytics ledger={ledger} cons={cons} disp={disp} reqs={kreqs} skus={skus} conv={conv}
       production={prod} phasing={phasing} days={days} setDays={setDays}
       onUploadProduction={uploadProduction} onUploadPhasing={uploadPhasing} uploadMsg={uploadMsg} />}
-
-    {/* ---------------- loss ---------------- */}
-    {tab === "loss" && <div style={card}>
-      <b>FG produced → packmat loss (today)</b>
-      <div style={{ fontSize: 13, color: C.muted, margin: "6px 0" }}>Upload FG produced (SKU, tonnes). Loss = issued today − should-consume.</div>
-      <input type="file" accept=".xlsx,.xls,.csv" onChange={(e) => e.target.files[0] && runLoss(e.target.files[0])} />
-      {loss && <div style={{ marginTop: 12 }}>
-        <div style={{ display: "flex", gap: 10, flexWrap: "wrap", marginBottom: 10 }}>
-          {["carton", "cld", "sac", "laminate"].map((k) => <Kpi key={k} label={`${LBL[k]} loss (t)`} val={loss.cat[k].toFixed(2)} color={loss.cat[k] > 0 ? C.red : C.green} />)}
-          <Kpi label="Total loss (t)" val={loss.total.toFixed(2)} color={C.slate} />
-        </div>
-        <table style={{ width: "100%", borderCollapse: "collapse" }}>
-          <thead><tr><th style={th}>SKU</th><th style={th}>Packmat</th><th style={th}>FG t</th><th style={th}>Should</th><th style={th}>Issued</th><th style={th}>Variance</th></tr></thead>
-          <tbody>{loss.detail.map((r, i) => r.flag
-            ? <tr key={i}><td style={td}>{r.code}</td><td style={{ ...td, color: C.amber }} colSpan={5}>{r.flag}</td></tr>
-            : <tr key={i}><td style={td}>{r.code}</td><td style={td}>{LBL[r.pm]}</td><td style={td}>{r.t}</td><td style={td}>{r.th}</td><td style={td}>{r.iss}</td>
-              <td style={{ ...td, fontWeight: 600, color: r.varB > 0 ? C.red : C.green }}>{r.varB > 0 ? "+" : ""}{r.varB}</td></tr>)}</tbody>
-        </table>
-      </div>}
-    </div>}
   </div>);
 }

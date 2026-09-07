@@ -17,7 +17,7 @@ export default function AppShell() {
       <button onClick={() => setRole(null)} style={{ background: "transparent", color: "#fff", border: "1px solid rgba(255,255,255,.4)", borderRadius: 6, padding: "4px 10px", cursor: "pointer" }}>Logout</button></div></div>);
 
   if (role === "store") return <><Bar /><App /></>;
-  if (role === "bce") return <BCECall />;
+  if (role === "bce") return <BCECall onExit={() => setRole(null)} />;
   if (role === "commercial") return <><Bar /><Commercial /></>;
   // Kasani gets its own plain home screen (Goods Received / Stock Status / Dispatch)
   if (role === "kasani") return <><Bar /><KasaniHome /></>;

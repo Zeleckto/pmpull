@@ -5,7 +5,7 @@ import { upsertLineMaterials, clearLineMaterials, loadLinesMap, loadPackConfig }
 import {
   loadSkus, upsertSkus, updateSku, deleteAllSkus, loadConversion, upsertConversion,
   addLedger, addLedgerMany, loadLedger, computeOnHand, computeBlocked,
-  loadRequests, closeRequest,
+  loadRequests, fulfilRequest,
   loadKasaniRequests, addKasaniRequests, setKasaniStatus,
 } from "./data";
 
@@ -132,8 +132,8 @@ export default function App() {
         <Tab id="shortfall" badge={kasani.filter((k) => k.status === "open").length || 0}>Request Shortfall from Kasani</Tab>
       </div>
 
-      {tab === "requests" && <PMRequests requests={requests}
-        onFulfill={async (r) => { await addLedger({ sku_code: r.sku_code, packmat: r.packmat, direction: "issue", qty_base: r.qty_base, line: r.line, shift: r.shift, note: "fulfil request" }); await closeRequest(r.id); refresh(); }} />}
+      {tab === "requests" && <PMRequests requests={requests} skus={skus}
+        onAction={(r) => setModal({ type: "issue", sku: r.sku_code, packmat: r.packmat, qty: Math.round(r.qty_base), line: r.line, shift: r.shift, requestId: r.id, asked: Math.round(r.qty_base) })} />}
 
       {tab === "inventory" && <Inventory skus={skus} conv={conv} onHand={onHand} blocked={blocked} openModal={setModal} />}
 
@@ -150,6 +150,9 @@ export default function App() {
         onSave={async (e) => {
           await addLedger(e);
           if (modal.kasaniId) await setKasaniStatus(modal.kasaniId, "received");  // receive + close the ask together
+          // the ask stays on the request; qty_issued is what actually went out
+          if (modal.requestId) await fulfilRequest(modal.requestId, e.qty_base,
+            e.qty_base !== modal.asked ? `asked ${modal.asked}, issued ${e.qty_base}` : null);
           setModal(null); refresh();
         }} />}
     </div>
@@ -157,15 +160,30 @@ export default function App() {
 }
 
 // ---------------- PM Requests ----------------
-function PMRequests({ requests, onFulfill }) {
+function PMRequests({ requests, skus, onAction }) {
+  const descOf = (c) => ((skus || []).find((s) => s.code === c) || {}).description || "";
   return (<div style={card}>
     <b>Active requests from lines</b>
-    <div style={{ fontSize: 12, color: C.muted, margin: "4px 0 10px" }}>Requests raised by BCE/lines appear here to fulfil. (Empty until line-HMI or manual calls feed them.)</div>
+    <div style={{ fontSize: 12, color: C.muted, margin: "4px 0 10px" }}>
+      <b>Issue</b> opens the form already filled in with what the line asked for. Change the quantity if you give a different
+      amount — both figures are kept, so the gap between asked and given is on record.
+    </div>
     {requests.length === 0 ? <div style={{ color: C.muted, fontSize: 14, padding: 8 }}>No active requests.</div> :
       <table style={{ width: "100%", borderCollapse: "collapse" }}>
-        <thead><tr><th style={th}>Line</th><th style={th}>SKU</th><th style={th}>Packmat</th><th style={th}>Qty</th><th style={th}></th></tr></thead>
-        <tbody>{requests.map((r) => (<tr key={r.id}><td style={td}>{r.line}</td><td style={td}>{r.sku_code}</td><td style={td}>{LBL[r.packmat] || r.packmat}</td><td style={td}>{r.qty_base} {UNIT[r.packmat]}</td>
-          <td style={td}><button onClick={() => onFulfill(r)} style={btn(C.green)}>Give</button></td></tr>))}</tbody>
+        <thead><tr>
+          <th style={th}>Asked</th><th style={th}>Line</th><th style={th}>SKU</th><th style={th}>Description</th>
+          <th style={th}>Packmat</th><th style={th}>Qty asked</th><th style={th}>Shift</th><th style={th}></th>
+        </tr></thead>
+        <tbody>{requests.map((r) => (<tr key={r.id}>
+          <td style={{ ...td, fontSize: 12, color: C.muted }}>{String(r.ts || "").slice(11, 16)}</td>
+          <td style={{ ...td, fontWeight: 700 }}>{r.line || "—"}</td>
+          <td style={{ ...td, fontWeight: 600 }}>{r.sku_code}</td>
+          <td style={{ ...td, color: C.muted, fontSize: 13 }}>{descOf(r.sku_code).slice(0, 24)}</td>
+          <td style={td}>{LBL[r.packmat] || r.packmat}</td>
+          <td style={{ ...td, fontWeight: 600 }}>{Math.round(r.qty_base)} {UNIT[r.packmat]}</td>
+          <td style={td}>{r.shift || "—"}</td>
+          <td style={td}><button onClick={() => onAction(r)} style={btn(C.green)}>Issue…</button></td>
+        </tr>))}</tbody>
       </table>}
   </div>);
 }
@@ -288,6 +306,11 @@ function CountSheet({ skus, onHand, cfg = [], onClose, onSaved }) {
       <b>Sunday stock count</b>
       <input placeholder="search SKU / packmat code / description" value={q} onChange={(e) => setQ(e.target.value)} style={{ ...inp, width: 300 }} />
     </div>
+    {rows.length > 0 && rows.filter((r) => !r.pmCode).length === rows.length &&
+      <div style={{ fontSize: 12, color: C.amber, background: "#fffbeb", border: "1px solid #fde68a", borderRadius: 8, padding: "8px 10px", margin: "8px 0" }}>
+        ⚠ No packmat codes in the SKU master — the column below will stay empty. Re-import the SKU sheet in Settings with the
+        <b> Primary Code</b> and <b>Outer Code</b> columns filled.
+      </div>}
     <div style={{ fontSize: 12, color: C.muted, margin: "6px 0 10px" }}>
       Type the counted quantity only on the lines you actually counted — blanks are left alone.
       Pick the unit you counted in; it is converted before saving. Each changed line writes an <b>adjust</b> row to the ledger.
@@ -678,18 +701,32 @@ function Settings({ skus, msg, setMsg, refresh }) {
       rows.push({ code, description: String(row[iDesc] || ""), weight: w, primary_type: String(row[iPrim] || "").toLowerCase().includes("lam") ? "laminate" : "carton", outer_type: ot, primary_code: String(row[iPc] || ""), outer_code: String(row[iOc] || ""), divider: /divider|yes|required/.test(String(row[iAdd] || "").toLowerCase()) || (w >= 1000 && ot === "cld") });
     }
     if (!rows.length) { setMsg("No SKU rows found — check headers."); return; }
-    // A code appearing twice in the sheet would break the upsert, so collapse them here
-    // (last row wins) and say which ones repeated so the sheet can be corrected.
+    // A code appearing twice would break the upsert. MERGE those rows rather than letting
+    // the last one win: sheets often list a SKU once per packmat, so the carton code sits on
+    // one row and the outer code on another. Last-row-wins silently blanked one of them.
     const seen = new Map();
     const dupes = [];
-    rows.forEach((r) => { if (seen.has(r.code)) dupes.push(r.code); seen.set(r.code, r); });
+    const keep = (a2, b2) => (String(b2 ?? "").trim() ? b2 : a2);
+    rows.forEach((r) => {
+      const prev = seen.get(r.code);
+      if (!prev) { seen.set(r.code, { ...r }); return; }
+      dupes.push(r.code);
+      prev.description  = keep(prev.description, r.description);
+      prev.primary_code = keep(prev.primary_code, r.primary_code);
+      prev.outer_code   = keep(prev.outer_code, r.outer_code);
+      prev.weight       = r.weight || prev.weight;
+      prev.divider      = prev.divider || r.divider;
+    });
     const clean = [...seen.values()];
     const { error } = await upsertSkus(clean);
     if (error) { setMsg(`Error: ${error.message || error}`); return; }
     const uniq = [...new Set(dupes)];
-    setMsg(uniq.length
-      ? `Imported ${clean.length} SKUs. ${uniq.length} code(s) appeared more than once in the sheet — the last row of each was kept: ${uniq.slice(0, 8).join(", ")}${uniq.length > 8 ? ` +${uniq.length - 8} more` : ""}.`
-      : `Imported ${clean.length} SKUs.`);
+    const noCode = clean.filter((r) => !String(r.primary_code || "").trim() && !String(r.outer_code || "").trim()).length;
+    setMsg([
+      `Imported ${clean.length} SKUs.`,
+      uniq.length ? `${uniq.length} code(s) appeared on more than one row and were merged (codes and description combined): ${uniq.slice(0, 6).join(", ")}${uniq.length > 6 ? ` +${uniq.length - 6} more` : ""}.` : "",
+      noCode ? `⚠ ${noCode} SKU(s) still have no packmat code at all — check the "Primary Code" / "Outer Code" column headings in the sheet.` : "",
+    ].filter(Boolean).join(" "));
     refresh();
   });
 
@@ -852,7 +889,7 @@ function ActionModal({ modal, skus, onHand, lines = [], onClose, onSave }) {
   const [packmat, setPackmat] = useState(modal.packmat || "");
   const [qty, setQty] = useState(modal.qty ? String(modal.qty) : "");   // prefilled when it came from a Kasani ask
   const [unit, setUnit] = useState(baseUnit(modal.packmat || "carton"));
-  const [line, setLine] = useState(""); const [shift, setShift] = useState("A");
+  const [line, setLine] = useState(modal.line || ""); const [shift, setShift] = useState(modal.shift || "A");
   useEffect(() => { if (s && !comps.includes(packmat)) setPackmat(comps[0] || ""); }, [sku]); // eslint-disable-line
   useEffect(() => { setUnit(baseUnit(packmat || "carton")); }, [packmat]);
   const ordered = useMemo(() => sortSkusByStock(skus, onHand), [skus, onHand]);   // in-stock SKUs first
@@ -869,6 +906,14 @@ function ActionModal({ modal, skus, onHand, lines = [], onClose, onSave }) {
     });
   };
   return (<Overlay onClose={onClose}><b>{titles[modal.type]}</b>
+    {modal.requestId && <div style={{ fontSize: 12, color: C.slate, marginTop: 6, background: "#eff6ff", border: "1px solid #bfdbfe", borderRadius: 6, padding: "6px 8px" }}>
+      Line <b>{modal.line || "—"}</b> asked for <b>{modal.asked} {UNIT[modal.packmat]}</b>. Change the quantity if you issue a
+      different amount — the request keeps both numbers.
+      {Number(qty) > 0 && qb !== modal.asked &&
+        <div style={{ marginTop: 4, fontWeight: 700, color: qb < modal.asked ? C.amber : C.green }}>
+          Issuing {qb} — {qb < modal.asked ? `${modal.asked - qb} short of` : `${qb - modal.asked} more than`} the ask.
+        </div>}
+    </div>}
     {modal.kasaniId && <div style={{ fontSize: 12, color: C.green, marginTop: 6, background: "#f0fdf4", border: "1px solid #bbf7d0", borderRadius: 6, padding: "6px 8px" }}>
       Against Kasani request #{modal.kasaniId} ({modal.qty} {UNIT[modal.packmat]} asked). Change the quantity if less arrived — saving books it to the ledger and marks the request received.
     </div>}

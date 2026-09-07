@@ -300,9 +300,26 @@ export default function Analytics({
         </table>
       </Sec>}
 
-      <Sec title="FG produced vs packmat consumed"
-        hint="Consumed = issued − returned. A positive variance means more packaging went out than the tonnage justifies.">
-        {prodRows.rows.length === 0 ? <div style={{ color: C.muted, padding: 8 }}>No DPR uploaded for this shift.</div> :
+      <Sec title={`FG produced vs packmat consumed — ${scope === "shift" ? `${slot.date} shift ${slot.shift}` : "selected window"}`}
+        hint="Consumed = issued − returned, for the shift shown. A positive variance means more packaging went out than the tonnage justifies.">
+        <div style={{ display: "flex", gap: 8, alignItems: "center", flexWrap: "wrap", marginBottom: 10 }}>
+          <input type="date" value={slot.date} onChange={(e) => setSlot({ ...slot, date: e.target.value })} style={inp} />
+          <Seg>{["A", "B", "C"].map((x) => <Pill key={x} on={slot.shift === x} onClick={() => setSlot({ ...slot, shift: x })}>{x}</Pill>)}</Seg>
+          <button onClick={() => setSlot({ date: cur.date, shift: cur.shift })} style={{ ...inp, cursor: "pointer", background: "#fff" }}>now</button>
+          <span style={{ fontSize: 12, color: C.muted }}>{SHIFT_HOURS[slot.shift]} IST</span>
+        </div>
+        {/* say which half is missing rather than showing a blank table */}
+        {prodRows.rows.length === 0 ? (
+          <div style={{ fontSize: 13, background: "#fffbeb", border: "1px solid #fde68a", borderRadius: 8, padding: "10px 12px", color: C.amber }}>
+            <b>No DPR for {slot.date} shift {slot.shift}.</b> Upload the daily production report above — without the tonnes produced there is nothing to compare the packmat against.
+            {lineRows.length === 0 && <div style={{ marginTop: 6 }}>No packmat was issued in this shift either, so once the DPR is in, everything will read as unused.</div>}
+          </div>
+        ) : lineRows.length === 0 ? (
+          <div style={{ fontSize: 13, background: "#fef2f2", border: "1px solid #fecaca", borderRadius: 8, padding: "10px 12px", color: C.red, marginBottom: 10 }}>
+            <b>DPR loaded, but no packmat issues recorded for {slot.date} shift {slot.shift}.</b> Every line below will show the full requirement as a variance. Check the PM store actually booked its issues against this shift.
+          </div>
+        ) : null}
+        {prodRows.rows.length === 0 ? null :
           <table style={{ width: "100%", borderCollapse: "collapse" }}>
             <thead><tr>{prodRows.perLine && <th style={th}>Line</th>}<th style={th}>SKU</th><th style={th}>Packmat</th><th style={th}>FG t</th><th style={th}>Should use</th><th style={th}>Actually used</th><th style={th}>Variance</th><th style={th}>= FG t</th></tr></thead>
             <tbody>{prodRows.rows.map((r, i2) => r.flag

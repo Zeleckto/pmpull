@@ -7,7 +7,7 @@ const PINS = { store: "1111", kasani: "2222", commercial: "3333", bce: "" }; // 
 
 export default function Login({ onPick }) {
   const [pin, setPin] = useState(""); const [role, setRole] = useState(null); const [err, setErr] = useState("");
-  const roles = [["store", "PM Store"], ["kasani", "Kasani"], ["bce", "Line (BCE)"], ["commercial", "Commercial"]];
+  const roles = [["store", "PM Store"], ["kasani", "Kasani"], ["bce", "PAT Line"], ["commercial", "Commercial"]];
   const choose = (r) => { if (!PINS[r]) return onPick(r); setRole(r); setPin(""); setErr(""); };
   const submit = () => { if (pin === PINS[role]) onPick(role); else setErr("Wrong PIN"); };
   return (<div style={{ minHeight: "100vh", display: "flex", alignItems: "center", justifyContent: "center", background: "#f1f5f9", fontFamily: "system-ui,Arial" }}>
