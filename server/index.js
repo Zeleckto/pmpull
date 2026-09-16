@@ -29,8 +29,20 @@ function loadConfig() {
   if (fs.existsSync(file)) {
     try { cfg = JSON.parse(fs.readFileSync(file, "utf8")); }
     catch (e) { console.error(`\nconfig.json is not valid JSON:\n  ${e.message}\n`); process.exit(1); }
-  } else {
-    console.warn("! server/config.json not found — falling back to environment variables.");
+  } else if (!process.env.PGPASSWORD) {
+    // A fresh git clone has no config.json - it is git-ignored because it holds the
+    // password. Without it the next error would be "password authentication failed",
+    // which sends people hunting for the wrong problem.
+    console.error("");
+    console.error("  server/config.json is missing.");
+    console.error("");
+    console.error("  It is not in git on purpose - it holds the database password.");
+    console.error("  Create it, then set the password and port:");
+    console.error("");
+    console.error("      copy server\\config.example.json server\\config.json");
+    console.error("      notepad server\\config.json");
+    console.error("");
+    process.exit(1);
   }
   const s = cfg.server || {}, d = cfg.database || {}, a = cfg.app || {};
   return {

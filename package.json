@@ -8,7 +8,9 @@
     "build": "vite build",
     "preview": "vite preview",
     "server": "node server/index.js",
-    "offline": "npm run build && node server/index.js"
+    "offline": "npm run build && node server/index.js",
+    "db:check": "node scripts/db-check.mjs",
+    "db:watch": "node scripts/db-check.mjs --watch"
   },
   "dependencies": {
     "@supabase/supabase-js": "^2.45.0",
