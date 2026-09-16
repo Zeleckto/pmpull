@@ -30,36 +30,55 @@ implements those and nothing above it noticed.
 
 ### 1. Install PostgreSQL
 
-Download **PostgreSQL 16** for Windows (EDB installer). During setup:
-- Set a password for user `postgres` — **write it down**
-- Port `5432`
-- Leave pgAdmin 4 ticked (it is your SQL editor, replacing Supabase Studio)
+Download **PostgreSQL 16 or later** for Windows (EDB installer). During setup:
+- Set a password for user `postgres` - **write it down**
+- Leave pgAdmin 4 ticked (optional, but it is your SQL browser)
+- **Note the port it offers.** It is 5432 *only if no other PostgreSQL is installed.*
+
+> ### WARNING - if more than one PostgreSQL is installed, check the port
+>
+> This laptop has **PG15 on 5432** and **PG18 on 5433**. The installer silently picks the
+> next free port for a second version, and connecting to the wrong one reports
+> `password authentication failed` - which reads as a wrong password, not a wrong port.
+>
+> Find the real port:
+> ```powershell
+> Get-Content "C:\Program Files\PostgreSQL\18\data\postgresql.conf" | Select-String "^port"
+> ```
+> Use that number in `server/config.json`. On **this laptop it is 5433**; on the server PC,
+> where only one version will be installed, it will be **5432**.
 
 ### 2. Create the database and load the schema
 
-Open **SQL Shell (psql)** from the Start menu, press Enter through the prompts, enter your
-password, then:
-```sql
-CREATE DATABASE pmpull;
-\q
-```
+Set these once per terminal (adjust version folder and port to match yours):
 
-Then in PowerShell, from the project folder:
 ```powershell
 cd "C:\Users\jagan\Desktop\HUL\KPF PM Pull Website\pmpull"
-$env:PGPASSWORD="your-postgres-password"
-& "C:\Program Files\PostgreSQL\16\bin\psql.exe" -U postgres -d pmpull -f sql\schema.sql
+$env:PGPASSWORD="1212"
+$PSQL = "C:\Program Files\PostgreSQL\18\bin\psql.exe"
+$PORT = 5433
 ```
 
-**Expect no errors.** `schema.sql` is written for plain PostgreSQL — the RLS and
-`notify pgrst` lines that Supabase needed are gone. If anything fails, send me the message.
+Then:
+```powershell
+& $PSQL -U postgres -h localhost -p $PORT -d postgres -c "CREATE DATABASE pmpull;"
+& $PSQL -U postgres -h localhost -p $PORT -d pmpull -v ON_ERROR_STOP=1 -f sql\schema.sql
+```
+
+**Expect no errors.** `schema.sql` targets plain PostgreSQL - the RLS and `notify pgrst`
+lines Supabase needed are gone. Verified on PostgreSQL 18.6.
 
 Check it:
 ```powershell
-& "C:\Program Files\PostgreSQL\16\bin\psql.exe" -U postgres -d pmpull -c "\dt"
-& "C:\Program Files\PostgreSQL\16\bin\psql.exe" -U postgres -d pmpull -c "select count(*) from lines_map"
+& $PSQL -U postgres -h localhost -p $PORT -d pmpull -c "\dt"
+& $PSQL -U postgres -h localhost -p $PORT -d pmpull -c "select (select count(*) from pack_config) as units, (select count(*) from lines_map) as machines;"
 ```
-Expect **12 tables** and **21 machines**.
+Expect **12 tables**, **10 units**, **21 machines**.
+
+> **Do you need pgAdmin?** No. Creating the database and running `schema.sql` above is the
+> only manual database step there will ever be. After that the app creates, reads and
+> updates every row itself - you never write SQL again in normal use. Keep pgAdmin for
+> browsing data, checking a count, or a one-off correction.
 
 ### 3. Switch the build to offline mode
 
@@ -80,7 +99,8 @@ at startup if it spots a cloud build, so you cannot ship one by accident.
 copy server\config.example.json server\config.json
 notepad server\config.json
 ```
-Set `database.password` to your postgres password. Leave everything else.
+Set `database.password`, and **`database.port` to the port from step 1**
+(5433 on this laptop, 5432 on a machine with only one PostgreSQL).
 
 ### 5. Run it
 
