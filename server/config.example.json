@@ -1,0 +1,22 @@
+{
+  "_comment": "Copy to server/config.json and fill in. Environment variables of the same name override anything here.",
+
+  "server": {
+    "host": "0.0.0.0",
+    "port": 3000
+  },
+
+  "database": {
+    "host": "localhost",
+    "port": 5432,
+    "user": "postgres",
+    "password": "CHANGE-ME",
+    "database": "pmpull",
+    "pool": 10
+  },
+
+  "app": {
+    "staticDir": "dist",
+    "logQueries": false
+  }
+}
